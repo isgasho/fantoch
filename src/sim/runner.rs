@@ -8,6 +8,7 @@ use crate::planet::{Planet, Region};
 use crate::protocol::{Process, ToSend};
 use crate::sim::{Schedule, Simulation};
 use crate::time::SimTime;
+use rayon::prelude::*;
 use std::collections::HashMap;
 
 enum ScheduleAction<P: Process> {
@@ -143,26 +144,36 @@ where
             actions.into_iter().for_each(|action| {
                 match action {
                     ScheduleAction::SubmitToProc(process_id, cmd) => {
-                        // get process and executor
-                        let (process, executor) = self.simulation.get_process(process_id);
+                        // this scope is here so that `process` and `executor` are dropped
+                        let to_send = {
+                            // get process and executor
+                            let (mut process, mut executor) =
+                                self.simulation.get_process_mut(process_id);
 
-                        // register command in the executor
-                        executor.register(&cmd);
+                            // register command in the executor
+                            executor.register(&cmd);
 
-                        // submit to process and schedule output messages
-                        let to_send = process.submit(cmd);
+                            // submit to process and schedule output messages
+                            process.submit(cmd)
+                        };
+
                         self.schedule_send(MessageRegion::Process(process_id), Some(to_send));
                     }
                     ScheduleAction::SendToProc(from, process_id, msg) => {
-                        // get process and executor
-                        let (process, executor) = self.simulation.get_process(process_id);
+                        // this scope is here so that `process` and `executor` are dropped
+                        let (to_send, ready) = {
+                            // get process and executor
+                            let (mut process, mut executor) =
+                                self.simulation.get_process_mut(process_id);
 
-                        // handle message and get ready commands
-                        let to_send = process.handle(from, msg);
+                            // handle message and get ready commands
+                            let to_send = process.handle(from, msg);
 
-                        // handle new execution info in the executor
-                        let to_executor = process.to_executor();
-                        let ready = executor.handle(to_executor);
+                            // handle new execution info in the executor
+                            let to_executor = process.to_executor();
+                            let ready = executor.handle(to_executor);
+                            (to_send, ready)
+                        };
 
                         // schedule new messages
                         self.schedule_send(MessageRegion::Process(process_id), to_send);
@@ -176,7 +187,7 @@ where
                         // route to client and schedule new submit
                         let submit = self
                             .simulation
-                            .get_client(client_id)
+                            .get_client_mut(client_id)
                             .handle(cmd_result, &self.time);
                         self.schedule_submit(MessageRegion::Client(client_id), submit);
                     }
@@ -259,11 +270,10 @@ where
 
     /// Show processes' stats.
     /// TODO does this need to be mut?
-    fn processes_metrics(&mut self) {
-        let simulation = &mut self.simulation;
+    fn processes_metrics(&self) {
         self.process_to_region.keys().for_each(|process_id| {
             // get process from simulation
-            let (process, executor) = simulation.get_process(*process_id);
+            let (process, executor) = self.simulation.get_process(*process_id);
             println!("process {:?} stats:", process_id);
             process.show_metrics();
             executor.show_metrics();
@@ -272,30 +282,56 @@ where
 
     /// Get client's stats.
     /// TODO does this need to be mut?
-    fn clients_latencies(&mut self) -> HashMap<Region, (usize, Histogram)> {
-        let simulation = &mut self.simulation;
+    fn clients_latencies(&self) -> HashMap<Region, (usize, Histogram)> {
+        let mut region_to_clients = HashMap::new();
+        for (client_id, region) in self.client_to_region.iter() {
+            let clients = match region_to_clients.get_mut(region) {
+                Some(v) => v,
+                None => region_to_clients
+                    .entry(region.clone())
+                    .or_insert_with(Vec::new),
+            };
+            clients.push(*client_id);
+        }
+
         let mut region_to_latencies = HashMap::new();
 
         for (&client_id, region) in self.client_to_region.iter() {
             // get current metrics from this region
-            let (total_issued_commands, histogram) = match region_to_latencies.get_mut(region) {
+            let (total_issued_commands, histograms) = match region_to_latencies.get_mut(region) {
                 Some(v) => v,
                 None => region_to_latencies
                     .entry(region.clone())
-                    .or_insert((0, Histogram::new())),
+                    .or_insert((0, Vec::new())),
             };
 
             // get client from simulation
-            let client = simulation.get_client(client_id);
-
-            // update issued comamnds with this client's issued commands
-            *total_issued_commands += client.issued_commands();
-
-            // update region's histogram with this client's histogram
-            histogram.merge(client.latency_histogram());
+            let client = self.simulation.get_client(client_id);
         }
 
-        region_to_latencies
+        let simulation = &self.simulation;
+
+        // NEED TO OWN CLIENT TO MAKE THIS FASTER
+
+        region_to_clients
+            .into_par_iter()
+            .map(|(region, clients)| {
+                let (total_issued_commands, histogram) = clients.into_iter().fold(
+                    (0, Histogram::new()),
+                    |(commands_acc, histogram_acc), client_id| {
+                        // get client from simulation
+                        let client = simulation.get_client(client_id);
+
+                        // update region's histogram with this client's histogram
+                        histogram_acc.merge(client.latency_histogram());
+
+                        // update issued comamnds with this client's issued commands
+                        (commands_acc + client.issued_commands(), histogram_acc)
+                    },
+                );
+                (region, (total_issued_commands, histogram))
+            })
+            .collect()
     }
 }
 

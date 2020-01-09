@@ -504,9 +504,11 @@ mod tests {
         simulation.register_client(client_1);
 
         // register command in executor and submit it in newt 1
-        let (process, executor) = simulation.get_process(target);
-        executor.register(&cmd);
-        let mcollect = process.submit(cmd);
+        let mcollect = {
+            let (mut process, mut executor) = simulation.get_process_mut(target);
+            executor.register(&cmd);
+            process.submit(cmd)
+        };
 
         // check that the mcollect is being sent to 2 processes
         let ToSend { target, .. } = mcollect.clone();
@@ -553,14 +555,17 @@ mod tests {
             _ => panic!("Message::MPhantom not found!"),
         }
 
-        // process 1 should have something to the executor
-        let (process, executor) = simulation.get_process(process_id_1);
-        let to_executor = process.to_executor();
-        assert_eq!(to_executor.len(), 1);
+        let mut ready = {
+            // process 1 should have something to the executor
+            let (mut process, mut executor) = simulation.get_process_mut(process_id_1);
+            let to_executor = process.to_executor();
+            assert_eq!(to_executor.len(), 1);
 
-        // handle in executor and check there's a single command ready
-        let mut ready = executor.handle(to_executor);
-        assert_eq!(ready.len(), 1);
+            // handle in executor and check there's a single command ready
+            let ready = executor.handle(to_executor);
+            assert_eq!(ready.len(), 1);
+            ready
+        };
 
         // get that command
         let cmd_result = ready.pop().expect("there should a command ready");
@@ -571,14 +576,16 @@ mod tests {
         // check there's nothing to send
         assert!(to_sends.is_empty());
 
-        // process 1 should have something to the executor
-        let (process, executor) = simulation.get_process(process_id_1);
-        let to_executor = process.to_executor();
-        assert_eq!(to_executor.len(), 1);
+        {
+            // process 1 should have something to the executor
+            let (mut process, mut executor) = simulation.get_process_mut(process_id_1);
+            let to_executor = process.to_executor();
+            assert_eq!(to_executor.len(), 1);
 
-        // handle in executor and check that it didn't generate another command
-        let ready = executor.handle(to_executor);
-        assert!(ready.is_empty());
+            // handle in executor and check that it didn't generate another command
+            let ready = executor.handle(to_executor);
+            assert!(ready.is_empty());
+        }
         // -------------------------
 
         // handle the previous command result
@@ -586,7 +593,7 @@ mod tests {
             .forward_to_client(cmd_result, &time)
             .expect("there should a new submit");
 
-        let (process, _) = simulation.get_process(target);
+        let (mut process, _) = simulation.get_process_mut(target);
         let ToSend { msg, .. } = process.submit(cmd);
         if let Message::MCollect { dot, .. } = msg {
             assert_eq!(dot, Dot::new(process_id_1, 2));
