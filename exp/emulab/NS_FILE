@@ -1,0 +1,41 @@
+set ns [new Simulator]
+source tb_compat.tcl
+
+# Define os image
+set os UBUNTU18-64-STD
+
+# Define number of machines needed
+set machines 6
+
+# Define lan strings to add servers to them
+set lanstr1 ""
+
+# From best to worst {d820 d430 d710 pc3000}
+set type d430
+
+# Define types of hardware for different servers
+tb-make-hard-vtype nodes $type
+
+for {set i 0} {$i < $machines} {incr i} {
+    # Define node
+    set node($i) [$ns node]
+    tb-set-hardware $node($i) nodes
+    tb-set-node-os $node($i) $os
+    append lanstr1 " $node($i)"
+
+    # Define and bind the blockstores (local storage)
+    # The "bs($i)" storage object specification here is the equivalent of doing "mkextrafs /mnt/extra" on node($i).
+    set bs($i) [$ns blockstore]
+    $bs($i) set-class "local"
+    $bs($i) set-placement "sysvol"
+    $bs($i) set-size "50GB"
+    $bs($i) set-mount-point "/mnt/extra"
+    $bs($i) set-node $node($i)
+}
+
+# Put all the nodes in a lans with Gb lan and 0ms latency among all nodes in a lan
+set lan1 [$ns make-lan "$lanstr1" 1000Mb 0ms]
+$ns rtproto Static
+
+# Go!
+$ns run

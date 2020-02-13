@@ -1,0 +1,6 @@
+node-0          nodes        UBUNTU18-64-STD node-0.join-decomposition.CRDT.emulab.net
+node-1          nodes        UBUNTU18-64-STD node-1.join-decomposition.CRDT.emulab.net
+node-2          nodes        UBUNTU18-64-STD node-2.join-decomposition.CRDT.emulab.net
+node-3          nodes        UBUNTU18-64-STD node-3.join-decomposition.CRDT.emulab.net
+node-4          nodes        UBUNTU18-64-STD node-4.join-decomposition.CRDT.emulab.net
+node-5          nodes        UBUNTU18-64-STD node-5.join-decomposition.CRDT.emulab.net
