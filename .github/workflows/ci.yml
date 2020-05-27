@@ -29,9 +29,16 @@ jobs:
         timeout-minutes: 20
 
       - name: Coverage
-        uses: actions-rs/grcov@v0.1
+        uses: actions-rs/grcov@0.2-proto
         with:
-          config: .github/grcov.yml
+          args: >
+            --ignore-not-existing
+            --ignore "/*"
+            --ignore "fantoch_ps/src/bin/*"
+            --ignore "fantoch_bote/src/main.rs"
+            --output-type lcov
+            --output-path ./lcov.info
+            ./target/debug/
 
       - name: Coveralls
         uses: coverallsapp/github-action@master
