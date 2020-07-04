@@ -1,15 +1,10 @@
-use ahash::RandomState;
-use dashmap::iter::Iter;
-use dashmap::mapref::one::Ref;
-use dashmap::DashMap;
+use dashmap::{DashMap, ElementGuard, Iter};
 use fantoch::kvs::Key;
-
-type SharedIter<'a, V> =
-    Iter<'a, Key, V, RandomState, DashMap<Key, V, RandomState>>;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
-pub struct Shared<V> {
-    clocks: DashMap<Key, V>,
+pub struct Shared<V: 'static> {
+    clocks: Arc<DashMap<Key, V>>,
 }
 
 impl<V> Shared<V>
@@ -19,13 +14,13 @@ where
     // Create a `SharedClocks` instance.
     pub fn new() -> Self {
         // create clocks
-        let clocks = DashMap::new();
+        let clocks = Arc::new(DashMap::new());
         Self { clocks }
     }
 
     // Tries to retrieve the current value associated with `key`. If there's no
     // associated value, an entry will be created.
-    pub fn get(&self, key: &Key) -> Ref<'_, Key, V> {
+    pub fn get(&self, key: &Key) -> ElementGuard<Key, V> {
         match self.clocks.get(key) {
             Some(value) => value,
             None => {
@@ -35,7 +30,7 @@ where
         }
     }
 
-    pub fn iter(&self) -> SharedIter<'_, V> {
+    pub fn iter(&self) -> Iter<Key, V> {
         self.clocks.iter()
     }
 
@@ -52,6 +47,7 @@ where
         // `self.clocks.insert(key.clone(), V::default());`
         // - `Entry::or_*` methods from `dashmap` ensure that we don't lose any
         //   updates. See: https://github.com/xacrimon/dashmap/issues/47
-        self.clocks.entry(key.clone()).or_default();
+        // TODO this functionality seems to have been removed
+        // self.clocks.entry(key.clone()).or_default();
     }
 }

@@ -11,6 +11,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct AtomicKeyClocks {
     id: ProcessId,
+    // TODO remove arc
     clocks: Arc<Shared<AtomicU64>>,
 }
 
