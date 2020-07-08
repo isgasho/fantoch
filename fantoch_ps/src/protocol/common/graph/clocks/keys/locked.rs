@@ -12,7 +12,6 @@ type Clock = RwLock<VClock<ProcessId>>;
 #[derive(Debug, Clone)]
 pub struct LockedKeyClocks {
     n: usize, // number of processes
-    // TODO remove arc
     clocks: Arc<Shared<Clock>>,
     noop_clock: Arc<Clock>,
 }

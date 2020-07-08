@@ -1,11 +1,10 @@
 use dashmap::{DashMap, ElementGuard, Iter};
 use fantoch::kvs::Key;
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Shared<V: 'static> {
-    clocks: Arc<DashMap<Key, V>>,
+    clocks: DashMap<Key, V>,
 }
 
 impl<V> Shared<V>
@@ -15,7 +14,7 @@ where
     // Create a `SharedClocks` instance.
     pub fn new() -> Self {
         // create clocks
-        let clocks = Arc::new(DashMap::new());
+        let clocks = DashMap::new();
         Self { clocks }
     }
 
