@@ -76,6 +76,8 @@ pub enum Protocol {
     EPaxosLocked,
     FPaxos,
     NewtAtomic,
+    NewtLocked,
+    Basic,
 }
 
 impl Protocol {
@@ -85,6 +87,8 @@ impl Protocol {
             Protocol::EPaxosLocked => "epaxos_locked",
             Protocol::FPaxos => "fpaxos",
             Protocol::NewtAtomic => "newt_atomic",
+            Protocol::NewtLocked => "newt_locked",
+            Protocol::Basic => "basic",
         }
     }
 }
@@ -101,8 +105,17 @@ impl Testbed {
     }
 }
 
-// TODO make this async
-pub fn serialize<T>(data: T, file: impl AsRef<Path>) -> Result<(), Report>
+pub enum SerializationFormat {
+    Bincode,
+    Json,
+}
+
+// TODO maybe make this async
+pub fn serialize<T>(
+    data: T,
+    file: impl AsRef<Path>,
+    format: SerializationFormat,
+) -> Result<(), Report>
 where
     T: serde::Serialize,
 {
@@ -111,12 +124,22 @@ where
     // create a buf writer
     let buf = std::io::BufWriter::new(file);
     // and try to serialize
-    bincode::serialize_into(buf, &data).wrap_err("serialize")?;
+    match format {
+        SerializationFormat::Bincode => {
+            bincode::serialize_into(buf, &data).wrap_err("serialize")?
+        }
+        SerializationFormat::Json => {
+            serde_json::to_writer(buf, &data).wrap_err("serialize")?
+        }
+    }
     Ok(())
 }
 
-// TODO make this async
-pub fn deserialize<T>(file: impl AsRef<Path>) -> Result<T, Report>
+// TODO maybe make this async
+pub fn deserialize<T>(
+    file: impl AsRef<Path>,
+    format: SerializationFormat,
+) -> Result<T, Report>
 where
     T: serde::de::DeserializeOwned,
 {
@@ -125,6 +148,13 @@ where
     // create a buf reader
     let buf = std::io::BufReader::new(file);
     // and try to deserialize
-    let data = bincode::deserialize_from(buf).wrap_err("deserialize")?;
+    let data = match format {
+        SerializationFormat::Bincode => {
+            bincode::deserialize_from(buf).wrap_err("deserialize")?
+        }
+        SerializationFormat::Json => {
+            serde_json::from_reader(buf).wrap_err("deserialize")?
+        }
+    };
     Ok(data)
 }

@@ -1,9 +1,10 @@
 #[cfg(feature = "exp")]
 use crate::args;
 use crate::{FantochFeature, Protocol, RunMode, Testbed};
+use fantoch::client::Workload;
 use fantoch::config::Config;
 use fantoch::id::ProcessId;
-use fantoch::planet::Region;
+use fantoch::planet::{Planet, Region};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -23,7 +24,7 @@ const PROCESS_TCP_NODELAY: bool = true;
 // by default, each socket stream is buffered (with a buffer of size 8KBs),
 // which should greatly reduce the number of syscalls for small-sized messages
 const PROCESS_TCP_BUFFER_SIZE: usize = 8 * 1024;
-const PROCESS_TCP_FLUSH_INTERVAL: Option<usize> = Some(2); // millis
+const PROCESS_TCP_FLUSH_INTERVAL: Option<usize> = None;
 
 // if this value is 100, the run doesn't finish, which probably means there's a
 // deadlock somewhere with 1000 we can see that channels fill up sometimes with
@@ -45,17 +46,13 @@ const PING_INTERVAL: Option<usize> = Some(500); // every 500ms
 // if paxos, set process 1 as the leader
 const LEADER: ProcessId = 1;
 
-// clients config
-const CONFLICT_RATE: usize = 10;
-const COMMANDS_PER_CLIENT: usize = 500;
-const PAYLOAD_SIZE: usize = 4 * 1024;
-
 // client tcp config
 const CLIENT_TCP_NODELAY: bool = true;
 
 #[cfg(feature = "exp")]
 pub struct ProtocolConfig {
     id: ProcessId,
+    sorted: Option<Vec<ProcessId>>,
     ips: Vec<(String, Option<usize>)>,
     config: Config,
     tcp_nodelay: bool,
@@ -76,6 +73,7 @@ impl ProtocolConfig {
         protocol: Protocol,
         id: ProcessId,
         mut config: Config,
+        sorted: Option<Vec<ProcessId>>,
         ips: Vec<(String, Option<usize>)>,
     ) -> Self {
         let (workers, executors) =
@@ -83,6 +81,7 @@ impl ProtocolConfig {
 
         Self {
             id,
+            sorted,
             ips,
             config,
             tcp_nodelay: PROCESS_TCP_NODELAY,
@@ -123,6 +122,15 @@ impl ProtocolConfig {
             "--execute_at_commit",
             self.config.execute_at_commit(),
         ];
+        if let Some(sorted) = self.sorted.as_ref() {
+            // make sorted ids comma-separted
+            let sorted = sorted
+                .into_iter()
+                .map(|process_id| process_id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            args.extend(args!["--sorted", sorted]);
+        }
         if let Some(interval) = self.config.gc_interval() {
             args.extend(args!["--gc_interval", interval.as_millis()]);
         }
@@ -202,6 +210,8 @@ fn workers_executors_and_leader(
             (WORKERS + EXECUTORS, 1)
         }
         Protocol::NewtAtomic => (WORKERS, EXECUTORS),
+        Protocol::NewtLocked => (WORKERS, EXECUTORS),
+        Protocol::Basic => (WORKERS, EXECUTORS),
     }
 }
 
@@ -210,9 +220,7 @@ pub struct ClientConfig {
     id_start: usize,
     id_end: usize,
     ip: String,
-    conflict_rate: usize,
-    commands_per_client: usize,
-    payload_size: usize,
+    workload: Workload,
     tcp_nodelay: bool,
     channel_buffer_size: usize,
     metrics_file: String,
@@ -224,15 +232,14 @@ impl ClientConfig {
         id_start: usize,
         id_end: usize,
         ip: String,
+        workload: Workload,
         metrics_file: &str,
     ) -> Self {
         Self {
             id_start,
             id_end,
             ip,
-            conflict_rate: CONFLICT_RATE,
-            commands_per_client: COMMANDS_PER_CLIENT,
-            payload_size: PAYLOAD_SIZE,
+            workload,
             tcp_nodelay: CLIENT_TCP_NODELAY,
             channel_buffer_size: CHANNEL_BUFFER_SIZE,
             metrics_file: metrics_file.to_string(),
@@ -246,11 +253,11 @@ impl ClientConfig {
             "--address",
             self.ip_to_address(),
             "--conflict_rate",
-            self.conflict_rate,
+            self.workload.conflict_rate(),
             "--commands_per_client",
-            self.commands_per_client,
+            self.workload.commands_per_client(),
             "--payload_size",
-            self.payload_size,
+            self.workload.payload_size(),
             "--tcp_nodelay",
             self.tcp_nodelay,
             "--channel_buffer_size",
@@ -268,12 +275,14 @@ impl ClientConfig {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ExperimentConfig {
     pub regions: HashMap<Region, ProcessId>,
+    pub planet: Option<Planet>,
     pub run_mode: RunMode,
     pub features: Vec<FantochFeature>,
     pub testbed: Testbed,
     pub protocol: Protocol,
     pub config: Config,
     pub clients_per_region: usize,
+    pub workload: Workload,
     pub process_tcp_nodelay: bool,
     pub tcp_buffer_size: usize,
     pub tcp_flush_interval: Option<usize>,
@@ -281,9 +290,6 @@ pub struct ExperimentConfig {
     pub workers: usize,
     pub executors: usize,
     pub multiplexing: usize,
-    pub conflict_rate: usize,
-    pub commands_per_client: usize,
-    pub payload_size: usize,
     pub client_tcp_nodelay: bool,
     pub client_channel_buffer_size: usize,
 }
@@ -291,18 +297,21 @@ pub struct ExperimentConfig {
 impl ExperimentConfig {
     pub fn new(
         regions: HashMap<Region, ProcessId>,
+        planet: Option<Planet>,
         run_mode: RunMode,
         features: Vec<FantochFeature>,
         testbed: Testbed,
         protocol: Protocol,
         mut config: Config,
         clients_per_region: usize,
+        workload: Workload,
     ) -> Self {
         let (workers, executors) =
             workers_executors_and_leader(protocol, &mut config);
 
         Self {
             regions,
+            planet,
             run_mode,
             features,
             testbed,
@@ -316,9 +325,7 @@ impl ExperimentConfig {
             workers,
             executors,
             multiplexing: MULTIPLEXING,
-            conflict_rate: CONFLICT_RATE,
-            commands_per_client: COMMANDS_PER_CLIENT,
-            payload_size: PAYLOAD_SIZE,
+            workload,
             client_tcp_nodelay: CLIENT_TCP_NODELAY,
             client_channel_buffer_size: CHANNEL_BUFFER_SIZE,
         }

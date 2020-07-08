@@ -2,10 +2,11 @@ use crate::config::{
     ClientConfig, ExperimentConfig, ProtocolConfig, CLIENT_PORT, PORT,
 };
 use crate::exp::{self, Machines};
-use crate::util;
+use crate::{util, SerializationFormat};
 use crate::{FantochFeature, Protocol, RunMode, Testbed};
 use color_eyre::eyre::{self, WrapErr};
 use color_eyre::Report;
+use fantoch::client::Workload;
 use fantoch::config::Config;
 use fantoch::id::ProcessId;
 use fantoch::planet::{Planet, Region};
@@ -27,16 +28,22 @@ pub async fn bench_experiment(
     configs: Vec<(Protocol, Config)>,
     tracer_show_interval: Option<usize>,
     clients_per_region: Vec<usize>,
+    workload: Workload,
+    skip: impl Fn(Protocol, Config, usize) -> bool,
     results_dir: impl AsRef<Path>,
 ) -> Result<(), Report> {
     if tracer_show_interval.is_some() {
         panic!("vitor: you should set the timing feature for this to work!");
     }
 
-    for (protocol, config) in configs {
-        // check that we have the correct number of regions
-        assert_eq!(machines.region_count(), config.n());
-        for &clients in &clients_per_region {
+    for &clients in &clients_per_region {
+        for &(protocol, config) in &configs {
+            // check that we have the correct number of regions
+            assert_eq!(machines.region_count(), config.n());
+            // maybe skip configuration
+            if skip(protocol, config, clients) {
+                continue;
+            }
             run_experiment(
                 &machines,
                 run_mode,
@@ -47,6 +54,7 @@ pub async fn bench_experiment(
                 config,
                 tracer_show_interval,
                 clients,
+                workload,
                 &results_dir,
             )
             .await?;
@@ -65,6 +73,7 @@ async fn run_experiment(
     config: Config,
     tracer_show_interval: Option<usize>,
     clients_per_region: usize,
+    workload: Workload,
     results_dir: impl AsRef<Path>,
 ) -> Result<(), Report> {
     // start dstat in all machines
@@ -84,7 +93,7 @@ async fn run_experiment(
     .wrap_err("start_processes")?;
 
     // run clients
-    run_clients(clients_per_region, machines, process_ips)
+    run_clients(clients_per_region, workload, machines, process_ips)
         .await
         .wrap_err("run_clients")?;
 
@@ -94,12 +103,14 @@ async fn run_experiment(
     // create experiment config and pull metrics
     let exp_config = ExperimentConfig::new(
         machines.regions().clone(),
+        planet.clone(),
         run_mode,
         features,
         testbed,
         protocol,
         config,
         clients_per_region,
+        workload,
     );
     let exp_dir = pull_metrics(machines, exp_config, results_dir)
         .await
@@ -146,19 +157,30 @@ async fn start_processes(
     for (from_region, &process_id) in machines.regions() {
         let vm = machines.server(from_region);
 
+        // set sorted if on baremetal and no delay will be injected
+        let set_sorted = testbed == Testbed::Baremetal && planet.is_none();
+        let sorted = if set_sorted {
+            Some(
+                (process_id..=(n as ProcessId))
+                    .chain(1..process_id)
+                    .collect(),
+            )
+        } else {
+            None
+        };
+
         // get ips for this region
         let ips = all_but_self(from_region)
             .into_iter()
             .map(|(to_region, ip)| {
-                let delay =
-                    maybe_inject_delay(from_region, to_region, testbed, planet);
+                let delay = maybe_inject_delay(from_region, to_region, planet);
                 (ip.clone(), delay)
             })
             .collect();
 
         // create protocol config and generate args
         let mut protocol_config =
-            ProtocolConfig::new(protocol, process_id, config, ips);
+            ProtocolConfig::new(protocol, process_id, config, sorted, ips);
         if let Some(interval) = tracer_show_interval {
             protocol_config.set_tracer_show_interval(interval);
         }
@@ -189,30 +211,23 @@ async fn start_processes(
 fn maybe_inject_delay(
     from: &Region,
     to: &Region,
-    testbed: Testbed,
     planet: &Option<Planet>,
 ) -> Option<usize> {
-    match testbed {
-        Testbed::Aws => {
-            // do not inject delay in AWS
-            None
-        }
-        Testbed::Baremetal => {
-            // in this case, there should be a planet
-            let planet = planet.as_ref().expect("planet not found");
-            // find ping latency
-            let ping = planet
-                .ping_latency(from, to)
-                .expect("both regions should be part of the planet");
-            // the delay should be half the ping latency
-            let delay = (ping / 2) as usize;
-            Some(delay)
-        }
-    }
+    // inject delay if a planet was provided
+    planet.as_ref().map(|planet| {
+        // find ping latency
+        let ping = planet
+            .ping_latency(from, to)
+            .expect("both regions should be part of the planet");
+        // the delay should be half the ping latency
+        let delay = (ping / 2) as usize;
+        delay
+    })
 }
 
 async fn run_clients(
     clients_per_region: usize,
+    workload: Workload,
     machines: &Machines<'_>,
     process_ips: Ips,
 ) -> Result<(), Report> {
@@ -234,7 +249,7 @@ async fn run_clients(
 
         // create client config and generate args
         let client_config =
-            ClientConfig::new(id_start, id_end, ip, METRICS_FILE);
+            ClientConfig::new(id_start, id_end, ip, workload, METRICS_FILE);
         let args = client_config.to_args();
 
         let command = exp::fantoch_bin_script(
@@ -580,7 +595,11 @@ async fn save_exp_config(
         .wrap_err("create_dir_all")?;
 
     // save config file
-    crate::serialize(exp_config, format!("{}/exp_config.bincode", exp_dir))?;
+    crate::serialize(
+        exp_config,
+        format!("{}/exp_config.json", exp_dir),
+        SerializationFormat::Json,
+    )?;
     Ok(exp_dir)
 }
 

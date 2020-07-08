@@ -1,5 +1,6 @@
 use color_eyre::eyre::WrapErr;
 use color_eyre::Report;
+use fantoch::client::Workload;
 use fantoch::config::Config;
 use fantoch::planet::Planet;
 use fantoch_exp::exp::Machines;
@@ -25,10 +26,17 @@ const GC_INTERVAL: Option<Duration> = Some(Duration::from_millis(50)); // every 
 const TRANSITIVE_CONFLICTS: bool = true;
 const TRACER_SHOW_INTERVAL: Option<usize> = None;
 
+// clients config
+const CONFLICT_RATE: usize = 10;
+// const COMMANDS_PER_CLIENT: usize = 500000; // if LAN
+const COMMANDS_PER_CLIENT: usize = 500; // if WAN
+const PAYLOAD_SIZE: usize = 4096;
+
 // bench-specific config
 const BRANCH: &str = "master";
 // TODO allow more than one feature
-const FEATURE: Option<FantochFeature> = Some(FantochFeature::Amortize);
+// const FEATURE: Option<FantochFeature> = Some(FantochFeature::Amortize);
+const FEATURE: Option<FantochFeature> = None;
 
 macro_rules! config {
     ($n:expr, $f:expr, $tiny_quorums:expr, $clock_bump_interval:expr, $skip_fast_ack:expr) => {{
@@ -63,11 +71,11 @@ async fn main() -> Result<(), Report> {
     let configs = vec![
         // (protocol, (n, f, tiny quorums, clock bump interval, skip fast ack))
         (Protocol::NewtAtomic, config!(n, 1, false, None, false)),
-        /* (Protocol::NewtAtomic, config!(n, 2, false, None, false)),
-         * (Protocol::FPaxos, config!(n, 1, false, None, false)),
-         * (Protocol::FPaxos, config!(n, 2, false, None, false)),
-         * (Protocol::AtlasLocked, config!(n, 1, false, None, false)),
-         * (Protocol::AtlasLocked, config!(n, 2, false, None, false)), */
+        (Protocol::NewtAtomic, config!(n, 2, false, None, false)),
+        (Protocol::FPaxos, config!(n, 1, false, None, false)),
+        (Protocol::FPaxos, config!(n, 2, false, None, false)),
+        (Protocol::AtlasLocked, config!(n, 1, false, None, false)),
+        (Protocol::AtlasLocked, config!(n, 2, false, None, false)),
     ];
 
     let clients_per_region = vec![
@@ -85,20 +93,42 @@ async fn main() -> Result<(), Report> {
         1024 * 8,
         1024 * 16,
         1024 * 32,
-        // 1024 * 64,
-        // 1024 * 128,
     ];
+    let workload =
+        Workload::new(CONFLICT_RATE, COMMANDS_PER_CLIENT, PAYLOAD_SIZE);
 
-    baremetal_bench(regions, configs, clients_per_region).await
+    let skip = |protocol, _, clients| {
+        // skip Atlas with more than 4096 clients
+        protocol == Protocol::AtlasLocked && clients > 1024 * 4
+    };
+
+    // create AWS planet
+    let planet = Some(Planet::from("../latency_aws"));
+    // let planet = None;
+
+    baremetal_bench(
+        regions,
+        planet,
+        configs,
+        clients_per_region,
+        workload,
+        skip,
+    )
+    .await
     // aws_bench(regions, configs, clients_per_region).await
 }
 
 #[allow(dead_code)]
 async fn baremetal_bench(
     regions: Vec<Region>,
+    planet: Option<Planet>,
     configs: Vec<(Protocol, Config)>,
     clients_per_region: Vec<usize>,
-) -> Result<(), Report> {
+    workload: Workload,
+    skip: impl Fn(Protocol, Config, usize) -> bool,
+) -> Result<(), Report>
+where
+{
     let servers_count = regions.len();
     let clients_count = regions.len();
 
@@ -125,9 +155,6 @@ async fn baremetal_bench(
     .await
     .wrap_err("baremetal spawn")?;
 
-    // create AWS planet
-    let planet = Some(Planet::from("../latency_aws"));
-
     // run benchmarks
     run_bench(
         machines,
@@ -136,6 +163,8 @@ async fn baremetal_bench(
         planet,
         configs,
         clients_per_region,
+        workload,
+        skip,
     )
     .await
     .wrap_err("run bench")?;
@@ -148,10 +177,19 @@ async fn aws_bench(
     regions: Vec<Region>,
     configs: Vec<(Protocol, Config)>,
     clients_per_region: Vec<usize>,
+    workload: Workload,
+    skip: impl Fn(Protocol, Config, usize) -> bool,
 ) -> Result<(), Report> {
     let mut launcher: tsunami::providers::aws::Launcher<_> = Default::default();
-    let res =
-        do_aws_bench(&mut launcher, regions, configs, clients_per_region).await;
+    let res = do_aws_bench(
+        &mut launcher,
+        regions,
+        configs,
+        clients_per_region,
+        workload,
+        skip,
+    )
+    .await;
 
     // trap errors to make sure there's time for a debug
     if let Err(e) = &res {
@@ -171,6 +209,8 @@ async fn do_aws_bench(
     regions: Vec<Region>,
     configs: Vec<(Protocol, Config)>,
     clients_per_region: Vec<usize>,
+    workload: Workload,
+    skip: impl Fn(Protocol, Config, usize) -> bool,
 ) -> Result<(), Report> {
     // compute features
     let features = FEATURE.map(|feature| vec![feature]).unwrap_or_default();
@@ -201,6 +241,8 @@ async fn do_aws_bench(
         planet,
         configs,
         clients_per_region,
+        workload,
+        skip,
     )
     .await
     .wrap_err("run bench")?;
@@ -215,6 +257,8 @@ async fn run_bench(
     planet: Option<Planet>,
     configs: Vec<(Protocol, Config)>,
     clients_per_region: Vec<usize>,
+    workload: Workload,
+    skip: impl Fn(Protocol, Config, usize) -> bool,
 ) -> Result<(), Report> {
     fantoch_exp::bench::bench_experiment(
         machines,
@@ -225,6 +269,8 @@ async fn run_bench(
         configs,
         TRACER_SHOW_INTERVAL,
         clients_per_region,
+        workload,
+        skip,
         RESULTS_DIR,
     )
     .await

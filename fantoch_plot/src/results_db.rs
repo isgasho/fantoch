@@ -2,10 +2,11 @@ use color_eyre::eyre::{self, WrapErr};
 use color_eyre::Report;
 use fantoch::client::ClientData;
 use fantoch::metrics::Histogram;
-use fantoch::planet::Region;
-use fantoch_exp::{ExperimentConfig, Protocol};
+use fantoch::planet::{Planet, Region};
+use fantoch_exp::{ExperimentConfig, Protocol, SerializationFormat, Testbed};
 use std::collections::HashMap;
 use std::fs::DirEntry;
+use std::time::Duration;
 
 #[derive(Debug)]
 pub struct ResultsDB {
@@ -22,12 +23,14 @@ impl ResultsDB {
             let timestamp = timestamp.wrap_err("incorrect directory entry")?;
             // read the configuration of this experiment
             let exp_config_path = format!(
-                "{}/exp_config.bincode",
+                "{}/exp_config.json",
                 timestamp.path().as_path().display()
             );
-            let exp_config: ExperimentConfig =
-                fantoch_exp::deserialize(exp_config_path)
-                    .wrap_err("deserialize experiment config")?;
+            let exp_config: ExperimentConfig = fantoch_exp::deserialize(
+                exp_config_path,
+                SerializationFormat::Json,
+            )
+            .wrap_err("deserialize experiment config")?;
 
             // incrementally load data as it matched against some search
             let exp_data = None;
@@ -157,7 +160,7 @@ impl<'a> SearchBuilder<'a> {
                 // filter out configurations with different conflict_rate (if
                 // set)
                 if let Some(conflict_rate) = conflict_rate {
-                    if exp_config.conflict_rate != conflict_rate {
+                    if exp_config.workload.conflict_rate() != conflict_rate {
                         return false;
                     }
                 }
@@ -165,7 +168,7 @@ impl<'a> SearchBuilder<'a> {
                 // filter out configurations with different payload_size (if
                 // set)
                 if let Some(payload_size) = payload_size {
-                    if exp_config.payload_size != payload_size {
+                    if exp_config.workload.payload_size() != payload_size {
                         return false;
                     }
                 }
@@ -191,10 +194,13 @@ impl<'a> SearchBuilder<'a> {
                 let path = format!(
                     "{}/client_{}_metrics.bincode",
                     timestamp.path().display(),
-                    region.name()
+                    region.name(),
                 );
-                let client_data: ClientData = fantoch_exp::deserialize(path)
-                    .wrap_err("deserialize client data")?;
+                let client_data: ClientData = fantoch_exp::deserialize(
+                    path,
+                    SerializationFormat::Bincode,
+                )
+                .wrap_err("deserialize client data")?;
                 let res = client_metrics.insert(region.clone(), client_data);
                 assert!(res.is_none());
             }
@@ -210,6 +216,8 @@ impl<'a> SearchBuilder<'a> {
 
             // return experiment data
             *exp_data = Some(ExperimentData::new(
+                &exp_config.planet,
+                exp_config.testbed,
                 client_metrics,
                 global_client_metrics,
             ));
@@ -266,33 +274,78 @@ impl<'a> SearchBuilder<'a> {
 
 #[derive(Debug, Clone)]
 pub struct ExperimentData {
-    pub client_metrics: HashMap<Region, ClientData>,
-    pub global_client_metrics: ClientData,
     pub client_latency: HashMap<Region, Histogram>,
     pub global_client_latency: Histogram,
 }
 
 impl ExperimentData {
     fn new(
+        planet: &Option<Planet>,
+        testbed: Testbed,
         client_metrics: HashMap<Region, ClientData>,
         global_client_metrics: ClientData,
     ) -> Self {
+        // we should use milliseconds if: AWS or baremetal + injected latency
+        let precision = match testbed {
+            Testbed::Aws => {
+                // assert that no latency was injected
+                assert!(planet.is_none());
+                LatencyPrecision::Millis
+            }
+            Testbed::Baremetal => {
+                // use ms if latency was injected, otherwise micros
+                if planet.is_some() {
+                    LatencyPrecision::Millis
+                } else {
+                    LatencyPrecision::Micros
+                }
+            }
+        };
+
+        // create latency histogram per region
         let client_latency = client_metrics
             .clone()
             .into_iter()
             .map(|(region, client_data)| {
                 // create latency histogram
-                let histogram = Histogram::from(client_data.latency_data());
+                let latency = Self::extract_latency(
+                    precision,
+                    client_data.latency_data(),
+                );
+                let histogram = Histogram::from(latency);
                 (region, histogram)
             })
             .collect();
-        let global_client_latency =
-            Histogram::from(global_client_metrics.latency_data());
+        let latency = Self::extract_latency(
+            precision,
+            global_client_metrics.latency_data(),
+        );
+
+        // create global latency histogram
+        let global_client_latency = Histogram::from(latency);
+
         Self {
-            client_metrics,
-            global_client_metrics,
             client_latency,
             global_client_latency,
         }
     }
+
+    fn extract_latency(
+        precision: LatencyPrecision,
+        it: impl Iterator<Item = Duration>,
+    ) -> impl Iterator<Item = u64> {
+        it.map(move |duration| {
+            let latency = match precision {
+                LatencyPrecision::Micros => duration.as_micros(),
+                LatencyPrecision::Millis => duration.as_millis(),
+            };
+            latency as u64
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LatencyPrecision {
+    Micros,
+    Millis,
 }

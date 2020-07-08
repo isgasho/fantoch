@@ -1,5 +1,6 @@
 use dashmap::{DashMap, ElementGuard, Iter};
 use fantoch::kvs::Key;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -25,7 +26,32 @@ where
             Some(value) => value,
             None => {
                 self.maybe_insert(key);
-                self.get(key)
+                return self.get(key);
+            }
+        }
+    }
+
+    // Tries to retrieve the current value associated with `keys`. An entry will
+    // be created for each of the non-existing keys.
+    pub fn get_all<'k>(
+        &self,
+        keys: &BTreeSet<&'k Key>,
+        refs: &mut Vec<(&'k Key, ElementGuard<Key, V>)>,
+    ) {
+        for key in keys {
+            match self.clocks.get(*key) {
+                Some(value) => {
+                    refs.push((key, value));
+                }
+                None => {
+                    // clear any previous references to the map (since
+                    // `self.clocks.entry` can deadlock if we hold any
+                    // references to `self.clocks`)
+                    refs.clear();
+                    // make sure key exits, and start again
+                    self.maybe_insert(key);
+                    return self.get_all(keys, refs);
+                }
             }
         }
     }
