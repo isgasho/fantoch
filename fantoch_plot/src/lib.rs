@@ -1,23 +1,21 @@
 #![deny(rust_2018_idioms)]
 
+mod db;
 mod fmt;
 mod plot;
-mod results_db;
 
 // Re-exports.
+pub use db::{ExperimentData, ResultsDB, Search};
 pub use fmt::PlotFmt;
-pub use results_db::ResultsDB;
 
 use color_eyre::Report;
-use fantoch::metrics::Histogram;
-use fantoch_exp::Protocol;
 use plot::axes::Axes;
 use plot::figure::Figure;
 use plot::pyplot::PyPlot;
 use plot::Matplotlib;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 // defaults: [6.4, 4.8]
 // copied from: https://github.com/jonhoo/thesis/blob/master/graphs/common.py
@@ -34,9 +32,39 @@ pub enum ErrorBar {
     Without,
 }
 
-pub enum Latency {
+impl ErrorBar {
+    pub fn to_file_suffix(&self) -> String {
+        match self {
+            Self::Without => String::new(),
+            Self::With(percentile) => format!("_p{}", percentile * 100f64),
+        }
+    }
+}
+
+pub enum LatencyMetric {
     Average,
     Percentile(f64),
+}
+
+impl LatencyMetric {
+    pub fn to_file_suffix(&self) -> String {
+        match self {
+            Self::Average => String::new(),
+            Self::Percentile(percentile) => {
+                format!("_p{}", percentile * 100f64)
+            }
+        }
+    }
+}
+
+#[derive(PartialEq, Eq, Hash)]
+pub enum Style {
+    Label,
+    Color,
+    Hatch,
+    Marker,
+    LineStyle,
+    LineWidth,
 }
 
 enum AxisToScale {
@@ -70,47 +98,46 @@ pub fn set_global_style() -> Result<(), Report> {
     Ok(())
 }
 
-pub fn latency_plot(
+pub fn latency_plot<R>(
+    searches: Vec<Search>,
+    style_fun: Option<Box<dyn Fn(&Search) -> HashMap<Style, String>>>,
     n: usize,
-    clients_per_region: usize,
-    conflict_rate: usize,
-    payload_size: usize,
     error_bar: ErrorBar,
     output_file: &str,
     db: &mut ResultsDB,
-) -> Result<BTreeMap<(Protocol, usize), Histogram>, Report> {
+    f: impl Fn(&ExperimentData) -> R,
+) -> Result<Vec<(Search, R)>, Report> {
     const FULL_REGION_WIDTH: f64 = 10f64;
     const MAX_COMBINATIONS: usize = 6;
     // 80% of `FULL_REGION_WIDTH` when `MAX_COMBINATIONS` is reached
     const BAR_WIDTH: f64 = FULL_REGION_WIDTH * 0.8 / MAX_COMBINATIONS as f64;
 
-    let combinations = combinations(n);
-    assert!(combinations.len() <= MAX_COMBINATIONS);
+    // let combinations = combinations(n);
+    assert!(
+        searches.len() <= MAX_COMBINATIONS,
+        "latency_plot: expected less searches than the max number of combinations"
+    );
 
     // compute x:
     let x: Vec<_> = (0..n).map(|i| i as f64 * FULL_REGION_WIDTH).collect();
 
     // we need to shift all to the left by half of the number of combinations
-    let shift_left = combinations.len() as f64 / 2f64;
+    let shift_left = searches.len() as f64 / 2f64;
     // we also need to shift half bar to the right
     let shift_right = 0.5;
-    let combinations =
-        combinations
-            .into_iter()
-            .enumerate()
-            .map(|(index, combination)| {
-                // compute index according to shifts
-                let index = index as f64 - shift_left + shift_right;
-                // compute combination's shift
-                let shift = index * BAR_WIDTH;
-                (shift, combination)
-            });
+    let searches = searches.into_iter().enumerate().map(|(index, search)| {
+        // compute index according to shifts
+        let index = index as f64 - shift_left + shift_right;
+        // compute combination's shift
+        let shift = index * BAR_WIDTH;
+        (shift, search)
+    });
 
     // keep track of all regions
     let mut all_regions = HashSet::new();
 
-    // return global client metrics for each combination
-    let mut global_metrics = BTreeMap::new();
+    // aggregate the output of `f` for each search
+    let mut results = Vec::new();
 
     // start python
     let gil = Python::acquire_gil();
@@ -123,20 +150,16 @@ pub fn latency_plot(
     // keep track of the number of plotted instances
     let mut plotted = 0;
 
-    for (shift, (protocol, f)) in combinations {
-        // start search
-        let mut search = db.search();
-        let mut exp_data = search
-            .n(n)
-            .f(f)
-            .protocol(protocol)
-            .clients_per_region(clients_per_region)
-            .conflict_rate(conflict_rate)
-            .payload_size(payload_size)
-            .load()?;
+    for (shift, search) in searches {
+        // check `n`
+        assert_eq!(
+            search.n, n,
+            "latency_plot: value of n in search doesn't match the provided"
+        );
+        let mut exp_data = db.find(search)?;
         match exp_data.len() {
             0 => {
-                eprintln!("missing data for {} f = {}", PlotFmt::protocol_name(protocol), f);
+                eprintln!("missing data for {} f = {}", PlotFmt::protocol_name(search.protocol), search.f);
                 continue;
             },
             1 => (),
@@ -173,7 +196,7 @@ pub fn latency_plot(
 
         // plot it:
         // - maybe set error bars
-        let kwargs = bar_style(py, protocol, f, BAR_WIDTH)?;
+        let kwargs = bar_style(py, search, &style_fun, BAR_WIDTH)?;
         if let ErrorBar::With(_) = error_bar {
             pytry!(py, kwargs.set_item("yerr", (from_err, to_err)));
         }
@@ -181,9 +204,8 @@ pub fn latency_plot(
         ax.bar(x, y, Some(kwargs))?;
         plotted += 1;
 
-        // save global client metrics
-        global_metrics
-            .insert((protocol, f), exp_data.global_client_latency.clone());
+        // save new result
+        results.push((search, f(exp_data)));
 
         // update set of all regions
         for region in regions {
@@ -194,36 +216,39 @@ pub fn latency_plot(
     // set xticks
     ax.set_xticks(x, None)?;
 
-    // set x labels:
-    // - check the number of regions is correct
-    assert_eq!(all_regions.len(), n);
+    // only do the following check if we had at least one search matching
+    if plotted > 0 {
+        // set x labels:
+        // - check the number of regions is correct
+        assert_eq!(
+            all_regions.len(),
+            n,
+            "latency_plot: the number of regions doesn't match the n provided"
+        );
+    }
+
     let mut regions: Vec<_> = all_regions.into_iter().collect();
     regions.sort();
     // map regions to their pretty name
-    let labels: Vec<_> = regions
-        .into_iter()
-        .map(|region| PlotFmt::region_name(region))
-        .collect();
+    let labels: Vec<_> =
+        regions.into_iter().map(PlotFmt::region_name).collect();
     ax.set_xticklabels(labels, None)?;
 
     // set labels
     ax.set_ylabel("latency (ms)")?;
 
     // legend
-    add_legend(plotted, n, py, &ax)?;
+    add_legend(plotted, None, py, &ax)?;
 
     // end plot
-    end_plot(output_file, py, &plt, fig)?;
-
-    Ok(global_metrics)
+    end_plot(output_file, py, &plt, Some(fig))?;
+    Ok(results)
 }
 
 // based on: https://github.com/jonhoo/thesis/blob/master/graphs/vote-memlimit-cdf.py
 pub fn cdf_plot(
-    n: usize,
-    clients_per_region: usize,
-    conflict_rate: usize,
-    payload_size: usize,
+    searches: Vec<Search>,
+    style_fun: Option<Box<dyn Fn(&Search) -> HashMap<Style, String>>>,
     output_file: &str,
     db: &mut ResultsDB,
 ) -> Result<(), Report> {
@@ -238,47 +263,30 @@ pub fn cdf_plot(
     // keep track of the number of plotted instances
     let mut plotted = 0;
 
-    for (protocol, f) in combinations(n) {
-        inner_cdf_plot(
-            py,
-            &ax,
-            n,
-            f,
-            protocol,
-            clients_per_region,
-            conflict_rate,
-            payload_size,
-            &mut plotted,
-            db,
-        )?;
+    for search in searches {
+        inner_cdf_plot(py, &ax, search, &style_fun, &mut plotted, db)?;
     }
 
     // set cdf plot style
     inner_cdf_plot_style(py, &ax)?;
 
     // legend
-    add_legend(plotted, n, py, &ax)?;
+    add_legend(plotted, None, py, &ax)?;
 
     // end plot
-    end_plot(output_file, py, &plt, fig)?;
+    end_plot(output_file, py, &plt, Some(fig))?;
 
     Ok(())
 }
 
-pub fn cdf_plots(
-    n: usize,
-    clients_per_region: usize,
-    conflict_rate: usize,
-    payload_size: usize,
+pub fn cdf_plot_per_f(
+    searches: Vec<Search>,
+    style_fun: Option<Box<dyn Fn(&Search) -> HashMap<Style, String>>>,
     output_file: &str,
     db: &mut ResultsDB,
 ) -> Result<(), Report> {
-    let (mut protocols, mut fs): (Vec<_>, Vec<_>) =
-        combinations(n).into_iter().unzip();
-    protocols.sort_by_key(|&protocol| PlotFmt::protocol_name(protocol));
-    protocols.dedup();
-    fs.sort();
-    fs.dedup();
+    let fs: BTreeSet<_> = searches.iter().map(|search| search.f).collect();
+    let fs: Vec<_> = fs.into_iter().collect();
     match fs.as_slice() {
         [1, 2] => (),
         _ => panic!(
@@ -316,19 +324,9 @@ pub fn cdf_plots(
         // keep track of the number of plotted instances
         let mut plotted = 0;
 
-        for &protocol in protocols.iter() {
-            inner_cdf_plot(
-                py,
-                &ax,
-                n,
-                f,
-                protocol,
-                clients_per_region,
-                conflict_rate,
-                payload_size,
-                &mut plotted,
-                db,
-            )?;
+        // plot all searches that match this `f`
+        for search in searches.iter().filter(|search| search.f == f) {
+            inner_cdf_plot(py, &ax, *search, &style_fun, &mut plotted, db)?;
         }
 
         // set cdf plot style
@@ -339,15 +337,17 @@ pub fn cdf_plots(
             ax.xaxis.set_visible(false)?;
         }
 
+        // specific pull-up for this kind of plot
+        let y_bbox_to_anchor = Some(1.41);
         // legend
-        add_subplot_legend(plotted, n, py, &ax)?;
+        add_legend(plotted, y_bbox_to_anchor, py, &ax)?;
 
         // save axis
         previous_axis = Some(ax);
     }
 
     // end plot
-    end_plot(output_file, py, &plt, fig)?;
+    end_plot(output_file, py, &plt, Some(fig))?;
 
     Ok(())
 }
@@ -370,31 +370,18 @@ fn inner_cdf_plot_style(py: Python<'_>, ax: &Axes<'_>) -> Result<(), Report> {
 fn inner_cdf_plot(
     py: Python<'_>,
     ax: &Axes<'_>,
-    n: usize,
-    f: usize,
-    protocol: Protocol,
-    clients_per_region: usize,
-    conflict_rate: usize,
-    payload_size: usize,
+    search: Search,
+    style_fun: &Option<Box<dyn Fn(&Search) -> HashMap<Style, String>>>,
     plotted: &mut usize,
     db: &mut ResultsDB,
 ) -> Result<(), Report> {
-    // start search
-    let mut search = db.search();
-    let mut exp_data = search
-        .n(n)
-        .f(f)
-        .protocol(protocol)
-        .clients_per_region(clients_per_region)
-        .conflict_rate(conflict_rate)
-        .payload_size(payload_size)
-        .load()?;
+    let mut exp_data = db.find(search)?;
     match exp_data.len() {
         0 => {
             eprintln!(
                 "missing data for {} f = {}",
-                PlotFmt::protocol_name(protocol),
-                f
+                PlotFmt::protocol_name(search.protocol),
+                search.f
             );
             return Ok(());
         }
@@ -420,7 +407,7 @@ fn inner_cdf_plot(
     let y: Vec<_> = percentiles().collect();
 
     // plot it!
-    let kwargs = line_style(py, protocol, f)?;
+    let kwargs = line_style(py, search, style_fun)?;
     ax.plot(x, y, None, Some(kwargs))?;
     *plotted += 1;
 
@@ -428,11 +415,11 @@ fn inner_cdf_plot(
 }
 
 pub fn throughput_latency_plot(
+    searches: Vec<Search>,
+    style_fun: Option<Box<dyn Fn(&Search) -> HashMap<Style, String>>>,
     n: usize,
     clients_per_region: Vec<usize>,
-    conflict_rate: usize,
-    payload_size: usize,
-    latency: Latency,
+    latency: LatencyMetric,
     output_file: &str,
     db: &mut ResultsDB,
 ) -> Result<(), Report> {
@@ -447,26 +434,24 @@ pub fn throughput_latency_plot(
     // keep track of the number of plotted instances
     let mut plotted = 0;
 
-    for (protocol, f) in combinations(n) {
+    for mut search in searches {
+        // check `n`
+        assert_eq!(search.n, n, "throughput_latency_plot: value of n in search doesn't match the provided");
+
         // keep track of average latency that will be used to compute throughput
         let mut avg_latency = Vec::with_capacity(clients_per_region.len());
 
         // compute y: latency values for each number of clients
         let mut y = Vec::with_capacity(clients_per_region.len());
         for &clients in clients_per_region.iter() {
-            // start search
-            let mut search = db.search();
-            let mut exp_data = search
-                .n(n)
-                .f(f)
-                .protocol(protocol)
-                .clients_per_region(clients)
-                .conflict_rate(conflict_rate)
-                .payload_size(payload_size)
-                .load()?;
+            // refine search
+            search.clients_per_region(clients);
+
+            // execute search
+            let mut exp_data = db.find(search)?;
             match exp_data.len() {
                 0 => {
-                    eprintln!("missing data for {} f = {}", PlotFmt::protocol_name(protocol), f);
+                    eprintln!("missing data for {} f = {}", PlotFmt::protocol_name(search.protocol), search.f);
                     avg_latency.push(0f64);
                     y.push(0f64);
                     continue;
@@ -482,8 +467,8 @@ pub fn throughput_latency_plot(
 
             // compute latency to be plotted
             let latency = match latency {
-                Latency::Average => avg,
-                Latency::Percentile(percentile) => exp_data
+                LatencyMetric::Average => avg,
+                LatencyMetric::Percentile(percentile) => exp_data
                     .global_client_latency
                     .percentile(percentile)
                     .value(),
@@ -516,7 +501,7 @@ pub fn throughput_latency_plot(
             .unzip();
 
         // plot it!
-        let kwargs = line_style(py, protocol, f)?;
+        let kwargs = line_style(py, search, &style_fun)?;
         ax.plot(x, y, None, Some(kwargs))?;
         plotted += 1;
     }
@@ -529,36 +514,111 @@ pub fn throughput_latency_plot(
     ax.set_ylabel("latency (ms) [log-scale]")?;
 
     // legend
-    add_legend(plotted, n, py, &ax)?;
+    add_legend(plotted, None, py, &ax)?;
 
     // end plot
-    end_plot(output_file, py, &plt, fig)?;
+    end_plot(output_file, py, &plt, Some(fig))?;
 
     Ok(())
 }
 
-fn combinations(n: usize) -> Vec<(Protocol, usize)> {
-    let mut protocols = vec![
-        Protocol::NewtAtomic,
-        Protocol::AtlasLocked,
-        Protocol::FPaxos,
+pub fn dstat_table(
+    searches: Vec<Search>,
+    output_file: &str,
+    db: &mut ResultsDB,
+) -> Result<(), Report> {
+    let col_labels = vec![
+        "cpu_usr",
+        "cpu_sys",
+        "cpu_wait",
+        "net_recv (MB/s)",
+        "net_send (MB/s)",
+        "mem_used (MB)",
     ];
-    protocols.sort_by_key(|&protocol| PlotFmt::protocol_name(protocol));
-    let max_f = match n {
-        3 => 1,
-        5 => 2,
-        _ => panic!("combinations: unsupported n = {}", n),
-    };
+    let col_widths = vec![0.13, 0.13, 0.13, 0.20, 0.20, 0.20];
 
-    // compute all protocol combinations
-    let mut combinations = Vec::new();
-    for protocol in protocols {
-        for f in 1..=max_f {
-            combinations.push((protocol, f));
-        }
+    // protocol labels
+    let mut row_labels = Vec::with_capacity(searches.len());
+
+    // actual data
+    let mut cells = Vec::with_capacity(searches.len());
+
+    let mut has_data = false;
+    for search in searches {
+        let mut exp_data = db.find(search)?;
+        match exp_data.len() {
+            0 => {
+                eprintln!("missing data for {} f = {}", PlotFmt::protocol_name(search.protocol), search.f);
+                continue;
+            },
+            1 => (),
+            _ => panic!("found more than 1 matching experiment for this search criteria"),
+        };
+        let exp_data = exp_data.pop().unwrap();
+
+        // create row label
+        let row_label = format!(
+            "{} f = {}",
+            PlotFmt::protocol_name(search.protocol),
+            search.f
+        );
+        row_labels.push(row_label);
+
+        // fetch all cell data
+        let cpu_usr = exp_data.global_process_dstats.cpu_usr_mad();
+        let cpu_sys = exp_data.global_process_dstats.cpu_sys_mad();
+        let cpu_wait = exp_data.global_process_dstats.cpu_wait_mad();
+        let net_recv = exp_data.global_process_dstats.net_recv();
+        let net_send = exp_data.global_process_dstats.net_send_mad();
+        let mem_used = exp_data.global_process_dstats.mem_used_mad();
+
+        // create cell
+        let cell =
+            vec![cpu_usr, cpu_sys, cpu_wait, net_recv, net_send, mem_used];
+        let fmt_cell_data = |mad: (_, _)| format!("{} ± {}", mad.0, mad.1);
+        let cell: Vec<_> = cell.into_iter().map(fmt_cell_data).collect();
+
+        // save cell
+        cells.push(cell);
+
+        // mark that there's data to be plotted
+        has_data = true
     }
 
-    combinations
+    // only try to plot if there's any data
+    if has_data {
+        // start python
+        let gil = Python::acquire_gil();
+        let py = gil.python();
+        let plt = PyPlot::new(py)?;
+
+        // create table arguments
+        let kwargs = pydict!(
+            py,
+            ("colLabels", col_labels),
+            ("colWidths", col_widths),
+            ("rowLabels", row_labels),
+            ("cellText", cells),
+            ("colLoc", "center"),
+            ("cellLoc", "center"),
+            ("rowLoc", "right"),
+            ("loc", "center"),
+        );
+
+        let table = plt.table(Some(kwargs))?;
+        plt.axis("off")?;
+
+        // create font size font
+        table.auto_set_font_size(false)?;
+        table.set_fontsize(6.5)?;
+
+        // row labels are too wide without this
+        plt.tight_layout()?;
+
+        // end plot
+        end_plot(output_file, py, &plt, None)?;
+    }
+    Ok(())
 }
 
 // percentiles of interest
@@ -597,73 +657,56 @@ fn end_plot(
     output_file: &str,
     py: Python<'_>,
     plt: &PyPlot<'_>,
-    fig: Figure<'_>,
+    fig: Option<Figure<'_>>,
 ) -> Result<(), Report> {
     // save figure
     let kwargs = pydict!(py, ("format", "pdf"));
     plt.savefig(output_file, Some(kwargs))?;
 
-    // close the figure
-    plt.close(fig)?;
+    let kwargs = if let Some(fig) = fig {
+        // close the figure passed as argument
+        Some(pydict!(py, ("fig", fig.fig())))
+    } else {
+        // close the current figure
+        None
+    };
+    plt.close(kwargs)?;
 
     Ok(())
 }
 
 fn add_legend(
     plotted: usize,
-    n: usize,
+    y_bbox_to_anchor: Option<f64>,
     py: Python<'_>,
     ax: &Axes<'_>,
 ) -> Result<(), Report> {
-    // pull legend up
-    let y_bbox_to_anchor = match n {
-        3 => 1.17,
-        5 => 1.24,
-        _ => panic!("add_legend: unsupported n: {}", n),
-    };
+    // default values for `y_bbox_to_anchor`
+    let one_row = 1.17;
+    let two_rows = 1.255;
 
-    do_add_legend(plotted, y_bbox_to_anchor, py, ax)
-}
-
-fn add_subplot_legend(
-    plotted: usize,
-    n: usize,
-    py: Python<'_>,
-    ax: &Axes<'_>,
-) -> Result<(), Report> {
-    // pull legend up
-    let y_bbox_to_anchor = if n != 3 {
-        1.37
-    } else {
-        panic!("add_subplot_legend: unsupported n: {}", n)
-    };
-
-    do_add_legend(plotted, y_bbox_to_anchor, py, ax)
-}
-
-fn do_add_legend(
-    plotted: usize,
-    y_bbox_to_anchor: f64,
-    py: Python<'_>,
-    ax: &Axes<'_>,
-) -> Result<(), Report> {
-    let legend_ncol = match plotted {
-        0 => 0,
-        1 => 1,
-        2 => 2,
-        3 => 3,
-        4 => 2,
-        5 => 3,
-        6 => 3,
+    let (legend_ncol, y_bbox_to_anchor_default) = match plotted {
+        0 => (0, 0.0),
+        1 => (1, one_row),
+        2 => (2, one_row),
+        3 => (3, one_row),
+        4 => (2, two_rows),
+        5 => (3, two_rows),
+        6 => (3, two_rows),
         _ => panic!(
-            "do_add_legend: unsupported number of plotted instances: {}",
+            "add_legend: unsupported number of plotted instances: {}",
             plotted
         ),
     };
+
+    // use the default value if not set
+    let y_bbox_to_anchor = y_bbox_to_anchor.unwrap_or(y_bbox_to_anchor_default);
+
     // add legend
     let kwargs = pydict!(
         py,
         ("loc", "upper center"),
+        // pull legend up
         ("bbox_to_anchor", (0.5, y_bbox_to_anchor)),
         // remove box around legend:
         ("edgecolor", "white"),
@@ -740,36 +783,82 @@ fn set_log_scale(
     Ok(())
 }
 
-fn bar_style(
-    py: Python<'_>,
-    protocol: Protocol,
-    f: usize,
+fn bar_style<'a>(
+    py: Python<'a>,
+    search: Search,
+    style_fun: &Option<Box<dyn Fn(&Search) -> HashMap<Style, String>>>,
     bar_width: f64,
-) -> Result<&PyDict, Report> {
+) -> Result<&'a PyDict, Report> {
+    let protocol = search.protocol;
+    let f = search.f;
+
+    // compute styles
+    let mut styles = style_fun
+        .as_ref()
+        .map(|style_fun| style_fun(&search))
+        .unwrap_or_default();
+
+    // compute label, color and hatch
+    let label = styles
+        .remove(&Style::Label)
+        .unwrap_or_else(|| PlotFmt::label(protocol, f));
+    let color = styles
+        .remove(&Style::Color)
+        .unwrap_or_else(|| PlotFmt::color(protocol, f));
+    let hatch = styles
+        .remove(&Style::Hatch)
+        .unwrap_or_else(|| PlotFmt::hatch(protocol, f));
+
     let kwargs = pydict!(
         py,
-        ("label", PlotFmt::label(protocol, f)),
+        ("label", label),
         ("width", bar_width),
         ("edgecolor", "black"),
         ("linewidth", 1),
-        ("color", PlotFmt::color(protocol, f)),
-        ("hatch", PlotFmt::hatch(protocol, f)),
+        ("color", color),
+        ("hatch", hatch),
     );
     Ok(kwargs)
 }
 
-fn line_style(
-    py: Python<'_>,
-    protocol: Protocol,
-    f: usize,
-) -> Result<&PyDict, Report> {
+fn line_style<'a>(
+    py: Python<'a>,
+    search: Search,
+    style_fun: &Option<Box<dyn Fn(&Search) -> HashMap<Style, String>>>,
+) -> Result<&'a PyDict, Report> {
+    let protocol = search.protocol;
+    let f = search.f;
+
+    // compute styles
+    let mut styles = style_fun
+        .as_ref()
+        .map(|style_fun| style_fun(&search))
+        .unwrap_or_default();
+
+    // compute label, color, marker, linestyle and linewidth
+    let label = styles
+        .remove(&Style::Label)
+        .unwrap_or_else(|| PlotFmt::label(protocol, f));
+    let color = styles
+        .remove(&Style::Color)
+        .unwrap_or_else(|| PlotFmt::color(protocol, f));
+    let marker = styles
+        .remove(&Style::Marker)
+        .unwrap_or_else(|| PlotFmt::marker(protocol, f));
+    let linestyle = styles
+        .remove(&Style::LineStyle)
+        .unwrap_or_else(|| PlotFmt::linestyle(protocol, f));
+    let linewidth = styles
+        .remove(&Style::LineWidth)
+        .unwrap_or_else(|| PlotFmt::linewidth(f));
+
     let kwargs = pydict!(
         py,
-        ("label", PlotFmt::label(protocol, f)),
-        ("color", PlotFmt::color(protocol, f)),
-        ("marker", PlotFmt::marker(protocol, f)),
-        ("linestyle", PlotFmt::linestyle(protocol, f)),
-        ("linewidth", PlotFmt::linewidth(f)),
+        ("label", label),
+        ("color", color),
+        ("marker", marker),
+        ("linestyle", linestyle),
+        ("linewidth", linewidth),
     );
     Ok(kwargs)
 }

@@ -1,20 +1,33 @@
 mod common;
 
 use clap::{App, Arg};
-use fantoch::client::Workload;
+use fantoch::client::{KeyGen, ShardGen, Workload};
 use fantoch::id::ClientId;
 use std::error::Error;
 use std::time::Duration;
 
 const RANGE_SEP: &str = "-";
-const DEFAULT_CONFLICT_RATE: usize = 100;
+const DEFAULT_SHARDS_PER_COMMAND: usize = 1;
+const DEFAULT_SHARD_GEN: ShardGen = ShardGen::Random { shard_count: 1 };
+const DEFAULT_KEYS_PER_SHARD: usize = 1;
+const DEFAULT_KEY_GEN: KeyGen = KeyGen::ConflictRate { conflict_rate: 100 };
 const DEFAULT_COMMANDS_PER_CLIENT: usize = 1000;
 const DEFAULT_PAYLOAD_SIZE: usize = 100;
+
+type ClientArgs = (
+    Vec<ClientId>,
+    Vec<String>,
+    Option<Duration>,
+    Workload,
+    bool,
+    usize,
+    Option<String>,
+);
 
 fn main() -> Result<(), Box<dyn Error>> {
     let (
         ids,
-        address,
+        addresses,
         interval,
         workload,
         tcp_nodelay,
@@ -24,7 +37,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     common::tokio_runtime().block_on(fantoch::run::client(
         ids,
-        address,
+        addresses,
         interval,
         workload,
         tcp_nodelay,
@@ -33,15 +46,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     ))
 }
 
-fn parse_args() -> (
-    Vec<ClientId>,
-    String,
-    Option<Duration>,
-    Workload,
-    bool,
-    usize,
-    Option<String>,
-) {
+fn parse_args() -> ClientArgs {
     let matches = App::new("client")
         .version("0.1")
         .author("Vitor Enes <vitorenesduarte@gmail.com>")
@@ -55,10 +60,10 @@ fn parse_args() -> (
                 .takes_value(true),
         )
         .arg(
-            Arg::with_name("address")
-                .long("address")
-                .value_name("ADDR")
-                .help("address of the protocol instance to connect to")
+            Arg::with_name("addresses")
+                .long("addresses")
+                .value_name("ADDRESSES")
+                .help("comma-separated list of addresses to connect to (in the form IP:PORT e.g. 127.0.0.1:3000)")
                 .required(true)
                 .takes_value(true),
         )
@@ -70,10 +75,32 @@ fn parse_args() -> (
                 .takes_value(true),
         )
         .arg(
-            Arg::with_name("conflict_rate")
-                .long("conflict_rate")
-                .value_name("CONFLICT_RATE")
-                .help("number between 0 and 100 representing how contended the workload should be; default: 100")
+            Arg::with_name("shards_per_command")
+                .long("shards_per_command")
+                .value_name("SHARDS_PER_COMMAND")
+                .help("number of shards accessed by commands to be issued by each client; default: 1")
+                .takes_value(true),
+        )
+        .arg(
+            Arg::with_name("shard_gen")
+                .long("shard_gen")
+                .value_name("SHARD_GEN")
+                .help("representation of a shard generator; possible values 'random,10' where 10 is the number of shards; default: 'random,1'")
+                .required(true)
+                .takes_value(true),
+        )
+        .arg(
+            Arg::with_name("keys_per_shard")
+                .long("keys_per_shard")
+                .value_name("KEYS_PER_SHARD")
+                .help("number of keys per shard accessed by commands to be issued by each client; default: 1")
+                .takes_value(true),
+        )
+        .arg(
+            Arg::with_name("key_gen")
+                .long("key_gen")
+                .value_name("KEY_GEN")
+                .help("representation of a key generator; possible values 'conflict_rate,100' where 100 is the conflict rate, or 'zipf,1.3,10000' where 1.3 is the zipf coefficient (which should be non-zero) and 10000 the number of keys in the distribution; default: 'conflict_rate,100'")
                 .takes_value(true),
         )
         .arg(
@@ -94,7 +121,7 @@ fn parse_args() -> (
             Arg::with_name("tcp_nodelay")
                 .long("tcp_nodelay")
                 .value_name("TCP_NODELAY")
-                .help("set TCP_NODELAY; defaul: true")
+                .help("set TCP_NODELAY; default: true")
                 .takes_value(true),
         )
         .arg(
@@ -108,17 +135,20 @@ fn parse_args() -> (
             Arg::with_name("metrics_file")
                 .long("metrics_file")
                 .value_name("METRICS_FILE")
-                .help("file in which metrics written to; by default metrics are not logged")
+                .help("file in which metrics are written to; by default metrics are not logged")
                 .takes_value(true),
         )
         .get_matches();
 
     // parse arguments
     let ids = parse_id_range(matches.value_of("ids"));
-    let address = parse_address(matches.value_of("address"));
+    let addresses = parse_addresses(matches.value_of("addresses"));
     let interval = parse_interval(matches.value_of("interval"));
     let workload = parse_workload(
-        matches.value_of("conflict_rate"),
+        matches.value_of("shards_per_command"),
+        matches.value_of("shard_gen"),
+        matches.value_of("keys_per_shards"),
+        matches.value_of("key_gen"),
         matches.value_of("commands_per_client"),
         matches.value_of("payload_size"),
     );
@@ -131,7 +161,7 @@ fn parse_args() -> (
 
     println!("ids: {}-{}", ids.first().unwrap(), ids.last().unwrap());
     println!("client number: {}", ids.len());
-    println!("process address: {}", address);
+    println!("addresses: {:?}", addresses);
     println!("workload: {:?}", workload);
     println!("tcp_nodelay: {:?}", tcp_nodelay);
     println!("channel buffer size: {:?}", channel_buffer_size);
@@ -139,7 +169,7 @@ fn parse_args() -> (
 
     (
         ids,
-        address,
+        addresses,
         interval,
         workload,
         tcp_nodelay,
@@ -168,8 +198,12 @@ fn parse_id_range(id_range: Option<&str>) -> Vec<ClientId> {
     }
 }
 
-fn parse_address(addresses: Option<&str>) -> String {
-    addresses.expect("address should be set").to_string()
+fn parse_addresses(addresses: Option<&str>) -> Vec<String> {
+    addresses
+        .expect("addresses should be set")
+        .split(common::protocol::LIST_SEP)
+        .map(|address| address.to_string())
+        .collect()
 }
 
 fn parse_interval(interval: Option<&str>) -> Option<Duration> {
@@ -182,24 +216,114 @@ fn parse_interval(interval: Option<&str>) -> Option<Duration> {
 }
 
 fn parse_workload(
-    conflict_rate: Option<&str>,
+    shards_per_command: Option<&str>,
+    shard_gen: Option<&str>,
+    keys_per_shard: Option<&str>,
+    key_gen: Option<&str>,
     commands_per_client: Option<&str>,
     payload_size: Option<&str>,
 ) -> Workload {
-    let conflict_rate = parse_conflict_rate(conflict_rate);
+    let shards_per_command = parse_shards_per_command(shards_per_command);
+    let shard_gen = parse_shard_gen(shard_gen);
+    let keys_per_shard = parse_keys_per_shard(keys_per_shard);
+    let key_gen = parse_key_gen(key_gen);
     let commands_per_client = parse_commands_per_client(commands_per_client);
     let payload_size = parse_payload_size(payload_size);
-    Workload::new(conflict_rate, commands_per_client, payload_size)
+    Workload::new(
+        shards_per_command,
+        shard_gen,
+        keys_per_shard,
+        key_gen,
+        commands_per_client,
+        payload_size,
+    )
 }
 
-fn parse_conflict_rate(number: Option<&str>) -> usize {
+fn parse_shards_per_command(number: Option<&str>) -> usize {
     number
         .map(|number| {
             number
                 .parse::<usize>()
-                .expect("conflict rate should be a number")
+                .expect("shards per command should be a number")
         })
-        .unwrap_or(DEFAULT_CONFLICT_RATE)
+        .unwrap_or(DEFAULT_SHARDS_PER_COMMAND)
+}
+
+fn parse_shard_gen(shard_gen: Option<&str>) -> ShardGen {
+    shard_gen
+        .map(|key_gen| {
+            let parts: Vec<_> = key_gen.split(',').collect();
+            match parts.len() {
+                2 => (),
+                _ => panic!(
+                    "invalid specification of shard generator: {:?}",
+                    key_gen
+                ),
+            };
+            match parts[0] {
+                "random" => {
+                    if parts.len() != 2 {
+                        panic!(
+                            "random shard generator takes a single argument"
+                        );
+                    }
+                    let shard_count = parts[1]
+                        .parse::<usize>()
+                        .expect("number of shards should be a number");
+                    ShardGen::Random { shard_count }
+                }
+                sgen => panic!("invalid shard generator type: {}", sgen),
+            }
+        })
+        .unwrap_or(DEFAULT_SHARD_GEN)
+}
+
+fn parse_keys_per_shard(number: Option<&str>) -> usize {
+    number
+        .map(|number| {
+            number
+                .parse::<usize>()
+                .expect("keys per shard should be a number")
+        })
+        .unwrap_or(DEFAULT_KEYS_PER_SHARD)
+}
+
+fn parse_key_gen(key_gen: Option<&str>) -> KeyGen {
+    key_gen
+        .map(|key_gen| {
+            let parts: Vec<_>= key_gen.split(',').collect();
+            match parts.len() {
+                2 | 3 => (),
+                _ => panic!("invalid specification of key generator: {:?}", key_gen)
+            };
+            match parts[0] {
+                "conflict_rate" => {
+                    if parts.len() != 2 {
+                        panic!("conflict_rate key generator takes a single argument");
+                    }
+                    let conflict_rate = parts[1]
+                        .parse::<usize>()
+                        .expect("conflict rate should be a number");
+                    KeyGen::ConflictRate { conflict_rate }
+                }
+                "zipf" => {
+                    if parts.len() != 3 {
+                        panic!("zipf key generator takes two arguments");
+                    }
+                    let coefficient = parts[1]
+                        .parse::<f64>()
+                        .expect("zipf coefficient should be a float");
+                    let key_count = parts[2]
+                        .parse::<usize>()
+                        .expect("number of keys in the zipf distribution should be a number");
+                        KeyGen::Zipf {
+                            coefficient, key_count
+                        }
+                }
+                kgen => panic!("invalid key generator type: {}", kgen),
+            }
+        })
+        .unwrap_or(DEFAULT_KEY_GEN)
 }
 
 fn parse_commands_per_client(number: Option<&str>) -> usize {

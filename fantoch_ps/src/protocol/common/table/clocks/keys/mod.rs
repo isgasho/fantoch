@@ -9,17 +9,18 @@ mod locked;
 
 // Re-exports.
 pub use atomic::AtomicKeyClocks;
+pub use locked::FineLockedKeyClocks;
 pub use locked::LockedKeyClocks;
 pub use sequential::SequentialKeyClocks;
 
 use crate::protocol::common::table::Votes;
 use fantoch::command::Command;
-use fantoch::id::ProcessId;
+use fantoch::id::{ProcessId, ShardId};
 use std::fmt::Debug;
 
 pub trait KeyClocks: Debug + Clone {
     /// Create a new `KeyClocks` instance given the local process identifier.
-    fn new(id: ProcessId) -> Self;
+    fn new(id: ProcessId, shard_id: ShardId) -> Self;
 
     /// Makes sure there's a clock for each key in the command.
     fn init_clocks(&mut self, cmd: &Command);
@@ -56,7 +57,7 @@ mod tests {
 
     #[test]
     fn atomic_key_clocks() {
-        keys_clocks_flow::<AtomicKeyClocks>(false);
+        keys_clocks_flow::<AtomicKeyClocks>(true);
         keys_clocks_no_double_votes::<AtomicKeyClocks>();
     }
 
@@ -64,6 +65,12 @@ mod tests {
     fn locked_key_clocks() {
         keys_clocks_flow::<LockedKeyClocks>(true);
         keys_clocks_no_double_votes::<LockedKeyClocks>();
+    }
+
+    #[test]
+    fn fine_locked_key_clocks() {
+        keys_clocks_flow::<FineLockedKeyClocks>(false);
+        keys_clocks_no_double_votes::<FineLockedKeyClocks>();
     }
 
     #[test]
@@ -100,7 +107,9 @@ mod tests {
 
     fn keys_clocks_flow<KC: KeyClocks>(all_clocks_match: bool) {
         // create key clocks
-        let mut clocks = KC::new(1);
+        let process_id = 1;
+        let shard_id = 0;
+        let mut clocks = KC::new(process_id, shard_id);
 
         // keys
         let key_a = String::from("A");
@@ -139,10 +148,21 @@ mod tests {
         assert_eq!(clock, 3);
         assert_eq!(process_votes.len(), 2); // two keys
         assert_eq!(get_key_votes(&key_a, &process_votes), vec![3]);
+        let key_votes = get_key_votes(&key_b, &process_votes);
+        let mut which = 0;
         if all_clocks_match {
-            assert_eq!(get_key_votes(&key_b, &process_votes), vec![1, 2, 3]);
+            assert_eq!(key_votes, vec![1, 2, 3]);
         } else {
-            assert_eq!(get_key_votes(&key_b, &process_votes), vec![1]);
+            // NOTE it's possible that, even though not all clocks values have
+            // to match, they may match; this happens when the highest clock (of
+            // all keys being accessed) happens to be the first one to be
+            // iterated; this is not deterministic since we iterate keys in
+            // their HashMap order, which is not a "stable"
+            match key_votes.as_slice() {
+                [1] => which = 1,
+                [1, 2, 3] => which = 123,
+                _ => panic!("unexpected key votes vote: {:?}", key_votes),
+            }
         }
 
         // -------------------------
@@ -151,19 +171,30 @@ mod tests {
         if all_clocks_match {
             assert_eq!(clock, 4);
         } else {
-            assert_eq!(clock, 2);
+            match which {
+                1 => assert_eq!(clock, 2),
+                123 => assert_eq!(clock, 4),
+                _ => unreachable!("impossible 'which' value: {}", which),
+            }
         }
         assert_eq!(process_votes.len(), 1); // single key
+        let key_votes = get_key_votes(&key_b, &process_votes);
         if all_clocks_match {
-            assert_eq!(get_key_votes(&key_b, &process_votes), vec![4]);
+            assert_eq!(key_votes, vec![4]);
         } else {
-            assert_eq!(get_key_votes(&key_b, &process_votes), vec![2]);
+            match which {
+                1 => assert_eq!(key_votes, vec![2]),
+                123 => assert_eq!(key_votes, vec![4]),
+                _ => unreachable!("impossible 'which' value: {}", which),
+            }
         }
     }
 
     fn keys_clocks_no_double_votes<KC: KeyClocks>() {
         // create key clocks
-        let mut clocks = KC::new(1);
+        let process_id = 1;
+        let shard_id = 0;
+        let mut clocks = KC::new(process_id, shard_id);
 
         // command
         let key = String::from("A");
@@ -203,7 +234,9 @@ mod tests {
         let ranges = votes
             .get(key)
             .expect("process should have voted on this key");
-        // check that there's only one vote
+        // check that there's only one vote:
+        // - this is only try for `AtomicKeyClocks` because `Votes.add` tries to
+        //   compress with the last added vote
         assert_eq!(ranges.len(), 1);
         let start = ranges[0].start();
         let end = ranges[0].end();
@@ -218,7 +251,8 @@ mod tests {
     ) {
         // create clocks
         let process_id = 1;
-        let clocks = K::new(process_id);
+        let shard_id = 0;
+        let clocks = K::new(process_id, shard_id);
 
         // spawn workers
         let handles: Vec<_> = (0..nthreads)

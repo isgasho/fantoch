@@ -30,7 +30,7 @@ pub enum MultiSynodMessage<V> {
     MAccepted(Ballot, Slot),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MultiSynod<V> {
     // number of processes
     n: usize,
@@ -165,7 +165,7 @@ where
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Leader {
     // process identifier
     process_id: ProcessId,
@@ -190,7 +190,7 @@ impl Leader {
         Self {
             process_id,
             is_leader,
-            ballot,
+            ballot: ballot as Ballot,
             last_slot,
         }
     }
@@ -209,7 +209,7 @@ impl Leader {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Commander<V> {
     // maximum number of allowed failures
     f: usize,
@@ -259,7 +259,7 @@ where
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Acceptor<Value> {
     ballot: Ballot,
     accepted: HashMap<Slot, Accepted<Value>>,
@@ -274,7 +274,7 @@ where
     // identifer.
     fn new(initial_leader: ProcessId) -> Self {
         Self {
-            ballot: initial_leader,
+            ballot: initial_leader as Ballot,
             accepted: HashMap::new(),
         }
     }

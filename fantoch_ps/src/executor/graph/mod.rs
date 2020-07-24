@@ -15,7 +15,7 @@ use self::index::{PendingIndex, VertexIndex};
 use self::tarjan::{FinderResult, TarjanSCCFinder, Vertex, SCC};
 use fantoch::command::Command;
 use fantoch::config::Config;
-use fantoch::id::{Dot, ProcessId};
+use fantoch::id::{Dot, ProcessId, ShardId};
 use fantoch::log;
 use fantoch::util;
 use fantoch::HashSet;
@@ -46,9 +46,13 @@ enum FinderInfo {
 
 impl DependencyGraph {
     /// Create a new `Graph`.
-    pub fn new(process_id: ProcessId, config: &Config) -> Self {
+    pub fn new(
+        process_id: ProcessId,
+        shard_id: ShardId,
+        config: &Config,
+    ) -> Self {
         // create bottom executed clock
-        let ids = util::process_ids(config.n());
+        let ids = util::process_ids(shard_id, config.n());
         let executed_clock = AEClock::with(ids);
         // create indexes
         let vertex_index = VertexIndex::new();
@@ -267,7 +271,7 @@ impl fmt::Debug for DependencyGraph {
 mod tests {
     use super::*;
     use crate::util;
-    use fantoch::id::Rifl;
+    use fantoch::id::{ClientId, Rifl};
     use fantoch::HashMap;
     use permutator::{Combination, Permutation};
     use std::cell::RefCell;
@@ -277,10 +281,11 @@ mod tests {
     fn simple() {
         // create queue
         let process_id = 1;
+        let shard_id = 0;
         let n = 2;
         let f = 1;
         let config = Config::new(n, f);
-        let mut queue = DependencyGraph::new(process_id, &config);
+        let mut queue = DependencyGraph::new(process_id, shard_id, &config);
 
         // cmd 0
         let dot_0 = Dot::new(1, 1);
@@ -411,6 +416,8 @@ mod tests {
     /// executed it's because there's another missing dependency, and now it
     /// will wait for that one.
     fn pending_on_different_key_regression_test() {
+        let shard_id = 0;
+
         // create config
         let n = 1;
         let f = 1;
@@ -439,7 +446,7 @@ mod tests {
 
             // create queue
             let process_id = 1;
-            let mut queue = DependencyGraph::new(process_id, &config);
+            let mut queue = DependencyGraph::new(process_id, shard_id, &config);
 
             // add cmd 2
             queue.add(dot_2, cmd_2.clone(), clock_2.clone());
@@ -712,22 +719,24 @@ mod tests {
 
     #[test]
     fn test_add_random() {
+        let shard_id = 0;
         let n = 2;
         let iterations = 10;
         let events_per_process = 3;
 
         (0..iterations).for_each(|_| {
-            let args = random_adds(n, events_per_process);
+            let args = random_adds(shard_id, n, events_per_process);
             shuffle_it(n, args);
         });
     }
 
     fn random_adds(
+        shard_id: ShardId,
         n: usize,
         events_per_process: usize,
     ) -> Vec<(Dot, VClock<ProcessId>)> {
         // create dots
-        let dots: Vec<_> = util::process_ids(n)
+        let dots: Vec<_> = util::process_ids(shard_id, n)
             .flat_map(|process_id| {
                 (1..=events_per_process)
                     .map(move |event| Dot::new(process_id, event as u64))
@@ -739,7 +748,7 @@ mod tests {
             .clone()
             .into_iter()
             .map(|dot| {
-                let clock = VClock::with(util::process_ids(n));
+                let clock = VClock::with(util::process_ids(shard_id, n));
                 (dot, RefCell::new(clock))
             })
             .collect();
@@ -806,20 +815,21 @@ mod tests {
         transitive_conflicts: bool,
     ) -> Vec<Rifl> {
         // create queue
+        let shard_id = 0;
         let process_id = 1;
         let f = 1;
         let mut config = Config::new(n, f);
         config.set_transitive_conflicts(transitive_conflicts);
-        let mut queue = DependencyGraph::new(process_id, &config);
+        let mut queue = DependencyGraph::new(process_id, shard_id, &config);
         let mut all_rifls = HashSet::new();
         let mut sorted = Vec::new();
 
         args.into_iter().for_each(|(dot, clock)| {
             // create command rifl from its dot
-            let rifl = Rifl::new(dot.source(), dot.sequence());
+            let rifl = Rifl::new(dot.source() as ClientId, dot.sequence());
 
             // create command
-            let key = String::from("black");
+            let key = String::from("CONF");
             let value = String::from("");
             let cmd = Command::put(rifl, key, value);
 
@@ -882,19 +892,20 @@ mod tests {
     }
 
     fn check_sccs_found_with_missing_dep() -> bool {
-        let black_command = || {
+        let conflicting_command = || {
             let rifl = Rifl::new(1, 1);
-            Command::put(rifl, String::from("black"), String::new())
+            Command::put(rifl, String::from("CONF"), String::new())
         };
 
         // create queue
+        let shard_id = 0;
         let process_id = 4;
         let n = 5;
         let f = 1;
         let mut config = Config::new(n, f);
         let transitive_conflicts = false;
         config.set_transitive_conflicts(transitive_conflicts);
-        let mut queue = DependencyGraph::new(process_id, &config);
+        let mut queue = DependencyGraph::new(process_id, shard_id, &config);
 
         // // create vertex index and index all dots
         // let mut vertex_index = VertexIndex::new();
@@ -905,68 +916,68 @@ mod tests {
         let root_dot = Dot::new(5, 70);
         queue.vertex_index.index(Vertex::new(
             root_dot,
-            black_command(),
+            conflicting_command(),
             util::vclock(vec![60, 50, 50, 40, 61]),
         ));
 
         // (4, 31)
         queue.vertex_index.index(Vertex::new(
             Dot::new(4, 31),
-            black_command(),
+            conflicting_command(),
             util::vclock(vec![60, 50, 50, 30, 60]),
         ));
         // (4, 32)
         queue.vertex_index.index(Vertex::new(
             Dot::new(4, 32),
-            black_command(),
+            conflicting_command(),
             util::vclock(vec![60, 50, 50, 31, 60]),
         ));
         // (4, 33)
         queue.vertex_index.index(Vertex::new(
             Dot::new(4, 33),
-            black_command(),
+            conflicting_command(),
             util::vclock(vec![60, 50, 50, 32, 60]),
         ));
         // (4, 34)
         queue.vertex_index.index(Vertex::new(
             Dot::new(4, 34),
-            black_command(),
+            conflicting_command(),
             util::vclock(vec![60, 50, 50, 33, 60]),
         ));
         // (4, 35)
         queue.vertex_index.index(Vertex::new(
             Dot::new(4, 35),
-            black_command(),
+            conflicting_command(),
             util::vclock(vec![60, 50, 50, 34, 60]),
         ));
         // (4, 36)
         queue.vertex_index.index(Vertex::new(
             Dot::new(4, 36),
-            black_command(),
+            conflicting_command(),
             util::vclock(vec![60, 50, 50, 35, 60]),
         ));
         // (4, 37)
         queue.vertex_index.index(Vertex::new(
             Dot::new(4, 37),
-            black_command(),
+            conflicting_command(),
             util::vclock(vec![60, 50, 50, 36, 60]),
         ));
         // (4, 38)
         queue.vertex_index.index(Vertex::new(
             Dot::new(4, 38),
-            black_command(),
+            conflicting_command(),
             util::vclock(vec![60, 50, 50, 37, 60]),
         ));
         // (4, 39)
         queue.vertex_index.index(Vertex::new(
             Dot::new(4, 39),
-            black_command(),
+            conflicting_command(),
             util::vclock(vec![60, 50, 50, 38, 60]),
         ));
         // (4, 40)
         queue.vertex_index.index(Vertex::new(
             Dot::new(4, 40),
-            black_command(),
+            conflicting_command(),
             util::vclock(vec![60, 50, 50, 39, 60]),
         ));
 

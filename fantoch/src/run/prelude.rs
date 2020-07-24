@@ -1,10 +1,12 @@
 use super::pool;
 use super::task::chan::{ChannelReceiver, ChannelSender};
 use crate::command::{Command, CommandResult};
-use crate::executor::{Executor, ExecutorResult, MessageKey};
-use crate::id::{ClientId, Dot, ProcessId, Rifl};
+use crate::executor::{Executor, ExecutorMetrics, ExecutorResult, MessageKey};
+use crate::id::{ClientId, Dot, ProcessId, Rifl, ShardId};
 use crate::kvs::Key;
-use crate::protocol::{MessageIndex, PeriodicEventIndex, Protocol};
+use crate::protocol::{
+    MessageIndex, PeriodicEventIndex, Protocol, ProtocolMetrics,
+};
 use crate::util;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
@@ -41,12 +43,27 @@ pub fn worker_dot_index_shift(dot: &Dot) -> Option<(usize, usize)> {
 pub type RunResult<V> = Result<V, Box<dyn Error>>;
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ProcessHi(pub ProcessId);
+pub struct ProcessHi {
+    pub process_id: ProcessId,
+    pub shard_id: ShardId,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ClientHi(pub Vec<ClientId>);
 
+// If the command touches a single shard, then a `Submit` will be sent to that
+// shard. If the command touches more than on shard, a `Submit` will be sent to
+// one targetted shard and a `Register` will be sent to the remaining shards to
+// make sure that the client will eventually receive a `CommandResult` from all
+// shards.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ClientToServer {
+    Submit(Command),
+    Register(Command),
+}
+
 #[derive(Debug, Clone)]
-pub enum FromClient {
+pub enum ClientToExecutor {
     // clients can register
     Register(Vec<ClientId>, RiflAckSender, ExecutorResultSender),
     // unregister
@@ -59,14 +76,14 @@ pub enum FromClient {
 pub type RiflAckReceiver = ChannelReceiver<Rifl>;
 pub type RiflAckSender = ChannelSender<Rifl>;
 pub type ReaderReceiver<P> =
-    ChannelReceiver<(ProcessId, <P as Protocol>::Message)>;
+    ChannelReceiver<(ProcessId, ShardId, <P as Protocol>::Message)>;
 pub type WriterReceiver<P> = ChannelReceiver<Arc<<P as Protocol>::Message>>;
 pub type WriterSender<P> = ChannelSender<Arc<<P as Protocol>::Message>>;
-pub type ClientReceiver = ChannelReceiver<FromClient>;
-pub type CommandReceiver = ChannelReceiver<Command>;
-pub type CommandSender = ChannelSender<Command>;
-pub type CommandResultReceiver = ChannelReceiver<CommandResult>;
-pub type CommandResultSender = ChannelSender<CommandResult>;
+pub type ClientToExecutorReceiver = ChannelReceiver<ClientToExecutor>;
+pub type ClientToServerReceiver = ChannelReceiver<ClientToServer>;
+pub type ClientToServerSender = ChannelSender<ClientToServer>;
+pub type ServerToClientReceiver = ChannelReceiver<CommandResult>;
+pub type ServerToClientSender = ChannelSender<CommandResult>;
 pub type ExecutorResultReceiver = ChannelReceiver<ExecutorResult>;
 pub type ExecutorResultSender = ChannelSender<ExecutorResult>;
 pub type SubmitReceiver = ChannelReceiver<(Option<Dot>, Command)>;
@@ -78,9 +95,14 @@ pub type PeriodicEventReceiver<P, R> =
     ChannelReceiver<FromPeriodicMessage<P, R>>;
 pub type InspectFun<P, R> = (fn(&P) -> R, ChannelSender<R>);
 pub type InspectReceiver<P, R> = ChannelReceiver<InspectFun<P, R>>;
-pub type SortedProcessesSender = ChannelSender<ChannelSender<Vec<ProcessId>>>;
+pub type SortedProcessesSender =
+    ChannelSender<ChannelSender<Vec<(ProcessId, ShardId)>>>;
 pub type SortedProcessesReceiver =
-    ChannelReceiver<ChannelSender<Vec<ProcessId>>>;
+    ChannelReceiver<ChannelSender<Vec<(ProcessId, ShardId)>>>;
+pub type ProtocolMetricsReceiver = ChannelReceiver<(usize, ProtocolMetrics)>;
+pub type ProtocolMetricsSender = ChannelSender<(usize, ProtocolMetrics)>;
+pub type ExecutorMetricsReceiver = ChannelReceiver<(usize, ExecutorMetrics)>;
+pub type ExecutorMetricsSender = ChannelSender<(usize, ExecutorMetrics)>;
 
 // 1. workers receive messages from clients
 pub type ClientToWorkers = pool::ToPool<(Option<Dot>, Command)>;
@@ -99,15 +121,15 @@ impl pool::PoolIndex for (Option<Dot>, Command) {
 
 // 2. workers receive messages from readers
 pub type ReaderToWorkers<P> =
-    pool::ToPool<(ProcessId, <P as Protocol>::Message)>;
-// The following allows e.g. (ProcessId, <P as Protocol>::Message) to be
-// `ToPool::forward`
-impl<A> pool::PoolIndex for (ProcessId, A)
+    pool::ToPool<(ProcessId, ShardId, <P as Protocol>::Message)>;
+// The following allows e.g. (ProcessId, ShardId, <P as Protocol>::Message) to
+// be `ToPool::forward`
+impl<A> pool::PoolIndex for (ProcessId, ShardId, A)
 where
     A: MessageIndex,
 {
     fn index(&self) -> Option<(usize, usize)> {
-        self.1.index()
+        self.2.index()
     }
 }
 
@@ -149,7 +171,7 @@ where
 }
 
 // 4. executors receive messages from clients
-pub type ClientToExecutors = pool::ToPool<FromClient>;
+pub type ClientToExecutors = pool::ToPool<ClientToExecutor>;
 // The following allows e.g. (&Key, Rifl) to be `ToPool::forward_after`
 impl pool::PoolIndex for (&Key, Rifl) {
     fn index(&self) -> Option<(usize, usize)> {

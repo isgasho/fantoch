@@ -1,12 +1,16 @@
 use clap::{App, Arg};
 use fantoch::config::Config;
-use fantoch::id::ProcessId;
+use fantoch::id::{ProcessId, ShardId};
 use fantoch::protocol::Protocol;
 use std::error::Error;
 use std::net::IpAddr;
 use std::time::Duration;
 
-const LIST_SEP: &str = ",";
+pub const LIST_SEP: &str = ",";
+
+const DEFAULT_SHARDS: usize = 1;
+const DEFAULT_SHARD_ID: ShardId = 0;
+
 const DEFAULT_IP: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 3000;
 const DEFAULT_CLIENT_PORT: u16 = 4000;
@@ -28,56 +32,10 @@ const DEFAULT_SKIP_FAST_ACK: bool = false;
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
-#[allow(dead_code)]
-pub fn run<P>() -> Result<(), Box<dyn Error>>
-where
-    P: Protocol + Send + 'static,
-{
-    let (
-        process_id,
-        sorted_processes,
-        ip,
-        port,
-        client_port,
-        addresses,
-        config,
-        tcp_nodelay,
-        tcp_buffer_size,
-        tcp_flush_interval,
-        channel_buffer_size,
-        workers,
-        executors,
-        multiplexing,
-        execution_log,
-        tracer_show_interval,
-        ping_interval,
-    ) = parse_args();
-
-    let process = fantoch::run::process::<P, String>(
-        process_id,
-        sorted_processes,
-        ip,
-        port,
-        client_port,
-        addresses,
-        config,
-        tcp_nodelay,
-        tcp_buffer_size,
-        tcp_flush_interval,
-        channel_buffer_size,
-        workers,
-        executors,
-        multiplexing,
-        execution_log,
-        tracer_show_interval,
-        ping_interval,
-    );
-    super::tokio_runtime().block_on(process)
-}
-
-fn parse_args() -> (
+type ProtocolArgs = (
     ProcessId,
-    Option<Vec<ProcessId>>,
+    ShardId,
+    Option<Vec<(ProcessId, ShardId)>>,
     IpAddr,
     u16,
     u16,
@@ -93,7 +51,61 @@ fn parse_args() -> (
     Option<String>,
     Option<usize>,
     Option<usize>,
-) {
+    Option<String>,
+);
+
+#[allow(dead_code)]
+pub fn run<P>() -> Result<(), Box<dyn Error>>
+where
+    P: Protocol + Send + 'static,
+{
+    let (
+        process_id,
+        shard_id,
+        sorted_processes,
+        ip,
+        port,
+        client_port,
+        addresses,
+        config,
+        tcp_nodelay,
+        tcp_buffer_size,
+        tcp_flush_interval,
+        channel_buffer_size,
+        workers,
+        executors,
+        multiplexing,
+        execution_log,
+        tracer_show_interval,
+        ping_interval,
+        metrics_file,
+    ) = parse_args();
+
+    let process = fantoch::run::process::<P, String>(
+        process_id,
+        shard_id,
+        sorted_processes,
+        ip,
+        port,
+        client_port,
+        addresses,
+        config,
+        tcp_nodelay,
+        tcp_buffer_size,
+        tcp_flush_interval,
+        channel_buffer_size,
+        workers,
+        executors,
+        multiplexing,
+        execution_log,
+        tracer_show_interval,
+        ping_interval,
+        metrics_file,
+    );
+    super::tokio_runtime().block_on(process)
+}
+
+fn parse_args() -> ProtocolArgs {
     let matches = App::new("process")
         .version("0.1")
         .author("Vitor Enes <vitorenesduarte@gmail.com>")
@@ -107,10 +119,18 @@ fn parse_args() -> (
                 .takes_value(true),
         )
         .arg(
+            Arg::with_name("shard_id")
+                .long("shard_id")
+                .value_name("SHARD_ID")
+                .help("shard identifier; default: 0")
+                .required(true)
+                .takes_value(true),
+        )
+        .arg(
             Arg::with_name("sorted_processes")
                 .long("sorted")
                 .value_name("SORTED_PROCESSES")
-                .help("comma-separated list of process identifiers sorted by distance; if not set, processes will ping each other and try to figure out this list from ping latency; for this, 'ping_interval' should be set")
+                .help("comma-separated list of 'ID-SHARD_ID', where ID is the process id and SHARD-ID the identifier of the shard it belongs to, sorted by distance; if not set, processes will ping each other and try to figure out this list from ping latency; for this, 'ping_interval' should be set")
                 .takes_value(true),
         )
         .arg(
@@ -137,8 +157,8 @@ fn parse_args() -> (
         .arg(
             Arg::with_name("addresses")
                 .long("addresses")
-                .value_name("ADDR")
-                .help("comma-separated list of addresses to connect to; if a delay (in milliseconds) is to be injected, the address should be of the form ADDRESS-DELAY; for example, 127.0.0.1:300-120 injects a delay of 120 milliseconds before sending a message to the process at the 127.0.0.1:3000 address")
+                .value_name("ADDRESSES")
+                .help("comma-separated list of addresses to connect to; if a delay (in milliseconds) is to be injected, the address should be of the form IP:PORT-DELAY; for example, 127.0.0.1:3000-120 injects a delay of 120 milliseconds before sending a message to the process at the 127.0.0.1:3000 address")
                 .required(true)
                 .takes_value(true),
         )
@@ -146,7 +166,7 @@ fn parse_args() -> (
             Arg::with_name("n")
                 .long("processes")
                 .value_name("PROCESS_NUMBER")
-                .help("total number of processes")
+                .help("number of processes")
                 .required(true)
                 .takes_value(true),
         )
@@ -154,7 +174,15 @@ fn parse_args() -> (
             Arg::with_name("f")
                 .long("faults")
                 .value_name("FAULT_NUMBER")
-                .help("total number of allowed faults")
+                .help("number of allowed faults")
+                .required(true)
+                .takes_value(true),
+        )
+        .arg(
+            Arg::with_name("shards")
+                .long("shards")
+                .value_name("SHARDS_NUMBER")
+                .help("number of shards; default: 1")
                 .required(true)
                 .takes_value(true),
         )
@@ -211,14 +239,14 @@ fn parse_args() -> (
             Arg::with_name("tcp_nodelay")
                 .long("tcp_nodelay")
                 .value_name("TCP_NODELAY")
-                .help("TCP_NODELAY; defaul: true")
+                .help("TCP_NODELAY; default: true")
                 .takes_value(true),
         )
         .arg(
             Arg::with_name("tcp_buffer_size")
                 .long("tcp_buffer_size")
                 .value_name("TCP_BUFFER_SIZE")
-                .help("size of the TCP buffer; default: 8192 (8KBs)")
+                .help("size of the TCP buffer; default: 8192 (bytes)")
                 .takes_value(true),
         )
         .arg(
@@ -279,10 +307,18 @@ fn parse_args() -> (
                 .help("number indicating the interval (in milliseconds) between pings between processes; by default there's no pinging; if set, this value should be > 0")
                 .takes_value(true),
         )
+        .arg(
+            Arg::with_name("metrics_file")
+                .long("metrics_file")
+                .value_name("METRICS_FILE")
+                .help("file in which metrics are (periodically, every 5s) written to; by default metrics are not logged")
+                .takes_value(true),
+        )
         .get_matches();
 
     // parse arguments
     let process_id = parse_process_id(matches.value_of("id"));
+    let shard_id = parse_shard_id(matches.value_of("shard_id"));
     let sorted_processes =
         parse_sorted_processes(matches.value_of("sorted_processes"));
     let ip = parse_ip(matches.value_of("ip"));
@@ -290,9 +326,11 @@ fn parse_args() -> (
     let client_port = parse_client_port(matches.value_of("client_port"));
     let addresses = parse_addresses(matches.value_of("addresses"));
 
+    // parse config
     let config = build_config(
         parse_n(matches.value_of("n")),
         parse_f(matches.value_of("f")),
+        parse_shards(matches.value_of("shards")),
         parse_transitive_conflicts(matches.value_of("transitive_conflicts")),
         parse_execute_at_commit(matches.value_of("execute_at_commit")),
         parse_gc_interval(matches.value_of("gc_interval")),
@@ -320,6 +358,7 @@ fn parse_args() -> (
     let tracer_show_interval =
         parse_tracer_show_interval(matches.value_of("tracer_show_interval"));
     let ping_interval = parse_ping_interval(matches.value_of("ping_interval"));
+    let metrics_file = parse_metrics_file(matches.value_of("metrics_file"));
 
     println!("process id: {}", process_id);
     println!("sorted processes: {:?}", sorted_processes);
@@ -338,17 +377,19 @@ fn parse_args() -> (
     println!("execution log: {:?}", execution_log);
     println!("trace_show_interval: {:?}", tracer_show_interval);
     println!("ping_interval: {:?}", ping_interval);
+    println!("metrics file: {:?}", metrics_file);
 
     // check that the number of sorted processes equals `n` (if it was set)
     if let Some(sorted_processes) = &sorted_processes {
         assert_eq!(sorted_processes.len(), config.n());
     }
 
-    // check that the number of addresses equals `n - 1`
-    assert_eq!(addresses.len(), config.n() - 1);
+    // check that the number of addresses equals `(n * shards) - 1`
+    assert_eq!(addresses.len(), (config.n() * config.shards()) - 1);
 
     (
         process_id,
+        shard_id,
         sorted_processes,
         ip,
         port,
@@ -365,20 +406,42 @@ fn parse_args() -> (
         execution_log,
         tracer_show_interval,
         ping_interval,
+        metrics_file,
     )
 }
 
 fn parse_process_id(id: Option<&str>) -> ProcessId {
-    parse_id(id.expect("process id should be set"))
+    parse_id::<ProcessId>(id.expect("process id should be set"))
 }
 
-fn parse_id(id: &str) -> ProcessId {
-    id.parse::<ProcessId>()
-        .expect("process id should be a number")
+fn parse_shard_id(shard_id: Option<&str>) -> ShardId {
+    shard_id
+        .map(|id| parse_id::<ShardId>(id))
+        .unwrap_or(DEFAULT_SHARD_ID)
 }
 
-fn parse_sorted_processes(ids: Option<&str>) -> Option<Vec<ProcessId>> {
-    ids.map(|ids| ids.split(LIST_SEP).map(|id| parse_id(id)).collect())
+fn parse_id<I>(id: &str) -> I
+where
+    I: std::str::FromStr,
+    <I as std::str::FromStr>::Err: std::fmt::Debug,
+{
+    id.parse::<I>().expect("id should be a number")
+}
+
+fn parse_sorted_processes(
+    ids: Option<&str>,
+) -> Option<Vec<(ProcessId, ShardId)>> {
+    ids.map(|ids| {
+        ids.split(LIST_SEP)
+            .map(|entry| {
+                let parts: Vec<_> = entry.split('-').collect();
+                assert_eq!(parts.len(), 2, "each sorted process entry should have the form 'ID-SHARD_ID'");
+                let id = parse_id::<ProcessId>(parts[0]);
+                let shard_id = parse_id::<ShardId>(parts[1]);
+                (id, shard_id)
+            })
+            .collect()
+    })
 }
 
 fn parse_ip(ip: Option<&str>) -> IpAddr {
@@ -404,7 +467,7 @@ fn parse_addresses(addresses: Option<&str>) -> Vec<(String, Option<usize>)> {
         .expect("addresses should be set")
         .split(LIST_SEP)
         .map(|address| {
-            let parts: Vec<_> = address.split("-").collect();
+            let parts: Vec<_> = address.split('-').collect();
             let address = parts[0].to_string();
             match parts.len() {
                 1 => {
@@ -428,6 +491,7 @@ fn parse_addresses(addresses: Option<&str>) -> Vec<(String, Option<usize>)> {
 pub fn build_config(
     n: usize,
     f: usize,
+    shards: usize,
     transitive_conflicts: bool,
     execute_at_commit: bool,
     gc_interval: Option<Duration>,
@@ -438,6 +502,7 @@ pub fn build_config(
 ) -> Config {
     // create config
     let mut config = Config::new(n, f);
+    config.set_shards(shards);
     config.set_transitive_conflicts(transitive_conflicts);
     config.set_execute_at_commit(execute_at_commit);
     if let Some(gc_interval) = gc_interval {
@@ -467,6 +532,14 @@ pub fn parse_f(f: Option<&str>) -> usize {
     f.expect("f should be set")
         .parse::<usize>()
         .expect("f should be a number")
+}
+
+pub fn parse_shards(shards: Option<&str>) -> usize {
+    shards
+        .map(|shards| {
+            shards.parse::<usize>().expect("shards should be a number")
+        })
+        .unwrap_or(DEFAULT_SHARDS)
 }
 
 pub fn parse_transitive_conflicts(transitive_conflicts: Option<&str>) -> bool {
@@ -582,4 +655,8 @@ fn parse_ping_interval(ping_interval: Option<&str>) -> Option<usize> {
             .parse::<usize>()
             .expect("ping_interval should be a number")
     })
+}
+
+pub fn parse_metrics_file(metrics_file: Option<&str>) -> Option<String> {
+    metrics_file.map(String::from)
 }

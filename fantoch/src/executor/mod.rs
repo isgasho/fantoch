@@ -11,24 +11,31 @@ pub use pending::Pending;
 
 use crate::command::{Command, CommandResult};
 use crate::config::Config;
-use crate::id::{ClientId, ProcessId, Rifl};
+use crate::id::{ClientId, ProcessId, Rifl, ShardId};
 use crate::kvs::{KVOpResult, Key};
 use crate::metrics::Metrics;
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fmt::{self, Debug};
 
 pub trait Executor: Clone {
     // TODO why is Send needed?
     type ExecutionInfo: Debug
         + Clone
+        + PartialEq
+        + Eq
         + Serialize
         + DeserializeOwned
         + Send
         + Sync
         + MessageKey; // TODO why is Sync needed??
 
-    fn new(process_id: ProcessId, config: Config, executors: usize) -> Self;
+    fn new(
+        process_id: ProcessId,
+        shard_id: ShardId,
+        config: Config,
+        executors: usize,
+    ) -> Self;
 
     fn wait_for(&mut self, cmd: &Command);
 
@@ -45,7 +52,7 @@ pub trait Executor: Clone {
 
 pub type ExecutorMetrics = Metrics<ExecutorMetricsKind, u64>;
 
-#[derive(Clone, Hash, PartialEq, Eq)]
+#[derive(Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutorMetricsKind {
     ChainSize,
     ExecutionDelay,

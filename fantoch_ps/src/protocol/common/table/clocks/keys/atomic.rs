@@ -2,8 +2,8 @@ use super::KeyClocks;
 use crate::protocol::common::shared::Shared;
 use crate::protocol::common::table::{VoteRange, Votes};
 use fantoch::command::Command;
-use fantoch::id::ProcessId;
-use fantoch::kvs::Key;
+use fantoch::id::{ProcessId, ShardId};
+use fantoch::HashSet;
 use std::cmp;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -11,22 +11,27 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct AtomicKeyClocks {
     id: ProcessId,
+    shard_id: ShardId,
     clocks: Arc<Shared<AtomicU64>>,
 }
 
 impl KeyClocks for AtomicKeyClocks {
     /// Create a new `AtomicKeyClocks` instance.
-    fn new(id: ProcessId) -> Self {
+    fn new(id: ProcessId, shard_id: ShardId) -> Self {
         // create shared clocks
         let clocks = Shared::new();
         // wrap them in an arc
         let clocks = Arc::new(clocks);
 
-        Self { id, clocks }
+        Self {
+            id,
+            shard_id,
+            clocks,
+        }
     }
 
     fn init_clocks(&mut self, cmd: &Command) {
-        cmd.keys().for_each(|key| {
+        cmd.keys(self.shard_id).for_each(|key| {
             // get initializes the key to the default value, and that's exactly
             // what we want
             let _ = self.clocks.get(key);
@@ -34,38 +39,56 @@ impl KeyClocks for AtomicKeyClocks {
     }
 
     fn bump_and_vote(&mut self, cmd: &Command, min_clock: u64) -> (u64, Votes) {
-        // single round of votes:
+        // first round of votes:
         // - vote on each key and compute the highest clock seen
         // - this means that if we have more than one key, then we don't
         //   necessarily end up with all key clocks equal
-        let mut votes = Votes::with_capacity(cmd.key_count());
-        let highest = cmd
-            .keys()
-            .map(|key| {
-                // bump the `key` clock
+        // OPTIMIZATION: keep track of the highest bumped-to value; if we have
+        // to iterate in a way that the highest clock is iterated first, this
+        // will be almost equivalent to `LockedKeyClocks`
+
+        let key_count = cmd.key_count(self.shard_id);
+        let mut clocks = HashSet::with_capacity(key_count);
+        let mut votes = Votes::with_capacity(key_count);
+        let mut up_to = min_clock;
+        cmd.keys(self.shard_id).for_each(|key| {
+            // bump the `key` clock
+            let clock = self.clocks.get(key);
+            let previous_value = Self::bump(&clock, up_to);
+
+            // create vote range and save it
+            up_to = cmp::max(up_to, previous_value + 1);
+            let vr = VoteRange::new(self.id, previous_value + 1, up_to);
+            votes.set(key.clone(), vec![vr]);
+
+            // save final clock value
+            clocks.insert(up_to);
+        });
+
+        // second round of votes:
+        // - if not all clocks match (i.e. we didn't get a result equivalent to
+        //   `LockedKeyClocks`), try to make them match
+        if clocks.len() > 1 {
+            cmd.keys(self.shard_id).for_each(|key| {
                 let clock = self.clocks.get(key);
-                let previous_value = Self::bump(&clock, min_clock);
-
-                // create vote range and save it
-                let current_value = cmp::max(min_clock, previous_value + 1);
-                let vr =
-                    VoteRange::new(self.id, previous_value + 1, current_value);
-                votes.set(key.clone(), vec![vr]);
-
-                // return "current" clock value
-                current_value
+                if let Some(vr) = Self::maybe_bump(self.id, &clock, up_to) {
+                    votes.add(key, vr);
+                }
             })
-            .max()
-            .expect("there should be a maximum sequence");
-        (highest, votes)
+        }
+
+        (up_to, votes)
     }
 
     fn vote(&mut self, cmd: &Command, up_to: u64) -> Votes {
         // create votes
-        let mut votes = Votes::with_capacity(cmd.key_count());
-        for key in cmd.keys() {
+        let key_count = cmd.key_count(self.shard_id);
+        let mut votes = Votes::with_capacity(key_count);
+        for key in cmd.keys(self.shard_id) {
             let clock = self.clocks.get(key);
-            Self::maybe_bump(self.id, key, &clock, up_to, &mut votes);
+            if let Some(vr) = Self::maybe_bump(self.id, &clock, up_to) {
+                votes.set(key.clone(), vec![vr]);
+            }
         }
         votes
     }
@@ -78,7 +101,9 @@ impl KeyClocks for AtomicKeyClocks {
         self.clocks.iter().for_each(|entry| {
             let key = entry.key();
             let clock = entry.value();
-            Self::maybe_bump(self.id, key, &clock, up_to, &mut votes);
+            if let Some(vr) = Self::maybe_bump(self.id, &clock, up_to) {
+                votes.set(key.clone(), vec![vr]);
+            }
         });
 
         votes
@@ -107,11 +132,9 @@ impl AtomicKeyClocks {
     // Bump the clock to `up_to` if lower than `up_to`.
     fn maybe_bump(
         id: ProcessId,
-        key: &Key,
         clock: &AtomicU64,
         up_to: u64,
-        votes: &mut Votes,
-    ) {
+    ) -> Option<VoteRange> {
         let fetch_update =
             clock.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 if value < up_to {
@@ -120,9 +143,8 @@ impl AtomicKeyClocks {
                     None
                 }
             });
-        if let Ok(previous_value) = fetch_update {
-            let vr = VoteRange::new(id, previous_value + 1, up_to);
-            votes.set(key.clone(), vec![vr]);
-        }
+        fetch_update
+            .ok()
+            .map(|previous_value| VoteRange::new(id, previous_value + 1, up_to))
     }
 }

@@ -6,6 +6,9 @@ edition = "2018"
 authors = ["Vitor Enes <vitorenesduarte@gmail.com>"]
 license = "MIT/Apache-2.0"
 
+# by default, run the main binary
+default-run = "main"
+
 [features]
 default = ["exp"]
 exp = ["futures", "rusoto_core", "rusoto_credential", "rusoto_ec2", "tracing", "tracing-futures", "tracing-subscriber", "tokio", "tsunami"]
@@ -19,16 +22,16 @@ rusoto_credential = { version = "0.44.0", optional = true }
 rusoto_ec2 = { version = "0.44.0", optional = true }
 serde = { version = "1.0.114", features = ["derive"] }
 serde_json = "1.0.56"
-tracing = { version = "0.1.15", optional = true }
+tracing = { version = "0.1.16", optional = true }
 tracing-futures = { version = "0.2.4", optional = true }
-tracing-subscriber = { version = "0.2.6", optional = true }
+tracing-subscriber = { version = "0.2.7", optional = true }
 tokio = { version = "0.2.21", features = ["time"], optional = true }
 tsunami = { version = "0.11.0-beta.7", default-features = false, features = ["aws", "baremetal"], optional = true }
 
 fantoch = { path = "../fantoch" }
 
 [[bin]]
-name = "bench"
+name = "main"
 required-features = ["exp"]
 
 [[bin]]

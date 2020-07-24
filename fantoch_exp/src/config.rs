@@ -3,10 +3,15 @@ use crate::args;
 use crate::{FantochFeature, Protocol, RunMode, Testbed};
 use fantoch::client::Workload;
 use fantoch::config::Config;
-use fantoch::id::ProcessId;
+use fantoch::id::{ProcessId, ShardId};
 use fantoch::planet::{Planet, Region};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
+
+pub type RegionIndex = usize;
+pub type Placement = HashMap<(Region, ShardId), (ProcessId, RegionIndex)>;
+type PlacementFlat = Vec<(Region, ShardId, ProcessId, RegionIndex)>;
 
 // FIXED
 #[cfg(feature = "exp")]
@@ -51,7 +56,8 @@ const CLIENT_TCP_NODELAY: bool = true;
 
 #[cfg(feature = "exp")]
 pub struct ProtocolConfig {
-    id: ProcessId,
+    process_id: ProcessId,
+    shard_id: ShardId,
     sorted: Option<Vec<ProcessId>>,
     ips: Vec<(String, Option<usize>)>,
     config: Config,
@@ -65,22 +71,26 @@ pub struct ProtocolConfig {
     execution_log: Option<String>,
     tracer_show_interval: Option<usize>,
     ping_interval: Option<usize>,
+    metrics_file: String,
 }
 
 #[cfg(feature = "exp")]
 impl ProtocolConfig {
     pub fn new(
         protocol: Protocol,
-        id: ProcessId,
+        process_id: ProcessId,
+        shard_id: ShardId,
         mut config: Config,
         sorted: Option<Vec<ProcessId>>,
         ips: Vec<(String, Option<usize>)>,
+        metrics_file: &str,
     ) -> Self {
         let (workers, executors) =
             workers_executors_and_leader(protocol, &mut config);
 
         Self {
-            id,
+            process_id,
+            shard_id,
             sorted,
             ips,
             config,
@@ -94,6 +104,7 @@ impl ProtocolConfig {
             execution_log: EXECUTION_LOG,
             tracer_show_interval: TRACER_SHOW_INTERVAL,
             ping_interval: PING_INTERVAL,
+            metrics_file: metrics_file.to_string(),
         }
     }
 
@@ -104,7 +115,9 @@ impl ProtocolConfig {
     pub fn to_args(&self) -> Vec<String> {
         let mut args = args![
             "--id",
-            self.id,
+            self.process_id,
+            "--shard_id",
+            self.shard_id,
             "--ip",
             IP,
             "--port",
@@ -117,6 +130,8 @@ impl ProtocolConfig {
             self.config.n(),
             "--faults",
             self.config.f(),
+            "--shards",
+            self.config.shards(),
             "--transitive_conflicts",
             self.config.transitive_conflicts(),
             "--execute_at_commit",
@@ -125,7 +140,7 @@ impl ProtocolConfig {
         if let Some(sorted) = self.sorted.as_ref() {
             // make sorted ids comma-separted
             let sorted = sorted
-                .into_iter()
+                .iter()
                 .map(|process_id| process_id.to_string())
                 .collect::<Vec<_>>()
                 .join(",");
@@ -177,6 +192,7 @@ impl ProtocolConfig {
         if let Some(interval) = self.ping_interval {
             args.extend(args!["--ping_interval", interval]);
         }
+        args.extend(args!["--metrics_file", self.metrics_file]);
         args
     }
 
@@ -211,6 +227,7 @@ fn workers_executors_and_leader(
         }
         Protocol::NewtAtomic => (WORKERS, EXECUTORS),
         Protocol::NewtLocked => (WORKERS, EXECUTORS),
+        Protocol::NewtFineLocked => (WORKERS, EXECUTORS),
         Protocol::Basic => (WORKERS, EXECUTORS),
     }
 }
@@ -219,7 +236,7 @@ fn workers_executors_and_leader(
 pub struct ClientConfig {
     id_start: usize,
     id_end: usize,
-    ip: String,
+    ips: Vec<String>,
     workload: Workload,
     tcp_nodelay: bool,
     channel_buffer_size: usize,
@@ -231,14 +248,14 @@ impl ClientConfig {
     pub fn new(
         id_start: usize,
         id_end: usize,
-        ip: String,
+        ips: Vec<String>,
         workload: Workload,
         metrics_file: &str,
     ) -> Self {
         Self {
             id_start,
             id_end,
-            ip,
+            ips,
             workload,
             tcp_nodelay: CLIENT_TCP_NODELAY,
             channel_buffer_size: CHANNEL_BUFFER_SIZE,
@@ -247,13 +264,34 @@ impl ClientConfig {
     }
 
     pub fn to_args(&self) -> Vec<String> {
+        use fantoch::client::{KeyGen, ShardGen};
+        let shard_gen = match self.workload.shard_gen() {
+            ShardGen::Random { shard_count } => {
+                format!("random,{}", shard_count)
+            }
+        };
+        let key_gen = match self.workload.key_gen() {
+            KeyGen::ConflictRate { conflict_rate } => {
+                format!("conflict_rate,{}", conflict_rate)
+            }
+            KeyGen::Zipf {
+                coefficient,
+                key_count,
+            } => format!("zipf,{},{}", coefficient, key_count),
+        };
         args![
             "--ids",
             format!("{}-{}", self.id_start, self.id_end),
-            "--address",
-            self.ip_to_address(),
-            "--conflict_rate",
-            self.workload.conflict_rate(),
+            "--addresses",
+            self.ips_to_addresses(),
+            "--shards_per_command",
+            self.workload.shards_per_command(),
+            "--shard_gen",
+            shard_gen,
+            "--keys_per_shard",
+            self.workload.keys_per_shard(),
+            "--key_gen",
+            key_gen,
             "--commands_per_client",
             self.workload.commands_per_client(),
             "--payload_size",
@@ -267,14 +305,18 @@ impl ClientConfig {
         ]
     }
 
-    fn ip_to_address(&self) -> String {
-        format!("{}:{}", self.ip, CLIENT_PORT)
+    fn ips_to_addresses(&self) -> String {
+        self.ips
+            .iter()
+            .map(|ip| format!("{}:{}", ip, CLIENT_PORT))
+            .collect::<Vec<_>>()
+            .join(",")
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 pub struct ExperimentConfig {
-    pub regions: HashMap<Region, ProcessId>,
+    pub placement: PlacementFlat,
     pub planet: Option<Planet>,
     pub run_mode: RunMode,
     pub features: Vec<FantochFeature>,
@@ -296,7 +338,7 @@ pub struct ExperimentConfig {
 
 impl ExperimentConfig {
     pub fn new(
-        regions: HashMap<Region, ProcessId>,
+        placement: Placement,
         planet: Option<Planet>,
         run_mode: RunMode,
         features: Vec<FantochFeature>,
@@ -309,8 +351,14 @@ impl ExperimentConfig {
         let (workers, executors) =
             workers_executors_and_leader(protocol, &mut config);
 
+        // can't serialize to json with a key that is not a string, so let's
+        // flat it
+        let placement = placement
+            .into_iter()
+            .map(|((a, b), (c, d))| (a, b, c, d))
+            .collect();
         Self {
-            regions,
+            placement,
             planet,
             run_mode,
             features,
@@ -329,5 +377,23 @@ impl ExperimentConfig {
             client_tcp_nodelay: CLIENT_TCP_NODELAY,
             client_channel_buffer_size: CHANNEL_BUFFER_SIZE,
         }
+    }
+}
+
+impl fmt::Debug for ExperimentConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "config = {:?}", self.config)?;
+        writeln!(f, "protocol = {:?}", self.protocol)?;
+        writeln!(f, "clients_per_region = {:?}", self.clients_per_region)?;
+        writeln!(f, "workload = {:?}", self.workload)
+    }
+}
+
+// create filename prefix
+pub fn file_prefix(process_id: Option<ProcessId>, region: &Region) -> String {
+    if let Some(process_id) = process_id {
+        format!("{:?}_server_{}", region, process_id)
+    } else {
+        format!("{:?}_client", region)
     }
 }

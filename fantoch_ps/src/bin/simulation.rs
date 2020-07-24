@@ -1,4 +1,4 @@
-use fantoch::client::Workload;
+use fantoch::client::{KeyGen, ShardGen, Workload};
 use fantoch::config::Config;
 use fantoch::id::ProcessId;
 use fantoch::metrics::Histogram;
@@ -128,11 +128,20 @@ fn newt_real_time(aws: bool) {
                 }
 
                 // clients workload
-                let conflict_rate = 10;
+                let shards_per_command = 1;
+                let shard_gen = ShardGen::Random { shard_count: 1 };
+                let keys_per_shard = 1;
+                let key_gen = KeyGen::ConflictRate { conflict_rate: 10 };
                 let total_commands = 500;
                 let payload_size = 0;
-                let workload =
-                    Workload::new(conflict_rate, total_commands, payload_size);
+                let workload = Workload::new(
+                    shards_per_command,
+                    shard_gen,
+                    keys_per_shard,
+                    key_gen,
+                    total_commands,
+                    payload_size,
+                );
 
                 // process regions, client regions and planet
                 let process_regions = regions.clone();
@@ -187,7 +196,7 @@ fn newt_real_time(aws: bool) {
 }
 
 #[allow(dead_code)]
-fn equidistant<P: Protocol>(protocol_name: &str) {
+fn equidistant<P: Protocol + Eq>(protocol_name: &str) {
     // intra-region distance
     let distance = 200;
 
@@ -198,10 +207,20 @@ fn equidistant<P: Protocol>(protocol_name: &str) {
     let total_clients = 1000;
 
     // clients workload
-    let conflict_rate = 2;
+    let shards_per_command = 1;
+    let shard_gen = ShardGen::Random { shard_count: 1 };
+    let keys_per_shard = 1;
+    let key_gen = KeyGen::ConflictRate { conflict_rate: 2 };
     let total_commands = 500;
     let payload_size = 0;
-    let workload = Workload::new(conflict_rate, total_commands, payload_size);
+    let workload = Workload::new(
+        shards_per_command,
+        shard_gen,
+        keys_per_shard,
+        key_gen,
+        total_commands,
+        payload_size,
+    );
 
     for &(n, f) in &configs {
         // create planet and regions
@@ -236,7 +255,7 @@ fn equidistant<P: Protocol>(protocol_name: &str) {
 }
 
 #[allow(dead_code)]
-fn increasing_regions<P: Protocol>(protocol_name: &str) {
+fn increasing_regions<P: Protocol + Eq>(protocol_name: &str) {
     let planet = Planet::new();
     let regions13 = vec![
         Region::new("asia-southeast1"),
@@ -259,10 +278,20 @@ fn increasing_regions<P: Protocol>(protocol_name: &str) {
     let f = 1;
 
     // clients workload
-    let conflict_rate = 2;
+    let shards_per_command = 1;
+    let shard_gen = ShardGen::Random { shard_count: 1 };
+    let keys_per_shard = 1;
+    let key_gen = KeyGen::ConflictRate { conflict_rate: 2 };
     let total_commands = 500;
     let payload_size = 0;
-    let workload = Workload::new(conflict_rate, total_commands, payload_size);
+    let workload = Workload::new(
+        shards_per_command,
+        shard_gen,
+        keys_per_shard,
+        key_gen,
+        total_commands,
+        payload_size,
+    );
 
     // clients per region
     let clients_per_region = 1000 / 13;
@@ -299,7 +328,7 @@ fn increasing_regions<P: Protocol>(protocol_name: &str) {
     }
 }
 
-fn run<P: Protocol>(
+fn run<P: Protocol + Eq>(
     config: Config,
     workload: Workload,
     clients_per_region: usize,

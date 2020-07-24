@@ -25,6 +25,9 @@ pub mod ping;
 // This module contains delay's implementation.
 pub mod delay;
 
+// This module contains periodic metrics's implementation.
+pub mod metrics_logger;
+
 // Re-exports.
 pub use chan::channel;
 
@@ -177,8 +180,8 @@ async fn listener_task(
 ) {
     loop {
         match listener.accept().await {
-            Ok((stream, addr)) => {
-                log!("[listener] new connection: {:?}", addr);
+            Ok((stream, _addr)) => {
+                log!("[listener] new connection: {:?}", _addr);
 
                 // create connection
                 let connection =

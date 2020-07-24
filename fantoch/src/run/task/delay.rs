@@ -2,6 +2,13 @@ use super::chan::{ChannelReceiver, ChannelSender};
 use std::collections::VecDeque;
 use tokio::time::{self, Duration, Instant};
 
+#[derive(PartialEq)]
+enum ReadStatus {
+    Fail,
+    Read,
+    FailAfterRead,
+}
+
 pub async fn delay_task<M>(
     mut from: ChannelReceiver<M>,
     mut to: ChannelSender<M>,
@@ -13,11 +20,14 @@ pub async fn delay_task<M>(
     // element
     let mut queue = VecDeque::new();
     let delay = Duration::from_millis(delay);
+    let mut read_status = ReadStatus::Fail;
     loop {
         match queue.front() {
             None => {
                 let msg = from.recv().await;
-                enqueue(msg, delay, &mut queue);
+                if read_status != ReadStatus::FailAfterRead {
+                    enqueue(msg, delay, &mut queue, &mut read_status);
+                }
             }
             Some((next_instant, _)) => {
                 tokio::select! {
@@ -25,10 +35,13 @@ pub async fn delay_task<M>(
                         let msg = dequeue(&mut queue);
                         if let Err(e) = to.send(msg).await {
                             println!("[delay_task] error forwarding message: {:?}", e);
+                            break;
                         }
                     }
                     msg = from.recv() => {
-                        enqueue(msg, delay, &mut queue);
+                        if read_status != ReadStatus::FailAfterRead {
+                            enqueue(msg, delay, &mut queue, &mut read_status);
+                        }
                     }
                 }
             }
@@ -40,11 +53,21 @@ fn enqueue<M>(
     msg: Option<M>,
     delay: Duration,
     queue: &mut VecDeque<(Instant, M)>,
+    read_status: &mut ReadStatus,
 ) {
     if let Some(msg) = msg {
         queue.push_back((deadline(delay), msg));
+        if let ReadStatus::Fail = read_status {
+            // means we were in Fail, thus => Read
+            *read_status = ReadStatus::Read;
+        }
     } else {
         println!("[delay_task] error receiving message from parent");
+        if let ReadStatus::Read = read_status {
+            // means we were in Fail, then went to Read, thus =>
+            // FailAfterRead
+            *read_status = ReadStatus::FailAfterRead;
+        }
     }
 }
 

@@ -1,5 +1,6 @@
 use crate::config::{
-    ClientConfig, ExperimentConfig, ProtocolConfig, CLIENT_PORT, PORT,
+    ClientConfig, ExperimentConfig, ProtocolConfig, RegionIndex, CLIENT_PORT,
+    PORT,
 };
 use crate::exp::{self, Machines};
 use crate::{util, SerializationFormat};
@@ -13,7 +14,7 @@ use fantoch::planet::{Planet, Region};
 use std::collections::HashMap;
 use std::path::Path;
 
-type Ips = HashMap<Region, String>;
+type Ips = HashMap<ProcessId, String>;
 
 const LOG_FILE: &str = ".log";
 const DSTAT_FILE: &str = "dstat.csv";
@@ -28,7 +29,7 @@ pub async fn bench_experiment(
     configs: Vec<(Protocol, Config)>,
     tracer_show_interval: Option<usize>,
     clients_per_region: Vec<usize>,
-    workload: Workload,
+    workloads: Vec<Workload>,
     skip: impl Fn(Protocol, Config, usize) -> bool,
     results_dir: impl AsRef<Path>,
 ) -> Result<(), Report> {
@@ -36,28 +37,42 @@ pub async fn bench_experiment(
         panic!("vitor: you should set the timing feature for this to work!");
     }
 
-    for &clients in &clients_per_region {
-        for &(protocol, config) in &configs {
-            // check that we have the correct number of regions
-            assert_eq!(machines.region_count(), config.n());
-            // maybe skip configuration
-            if skip(protocol, config, clients) {
-                continue;
+    for workload in workloads {
+        for &clients in &clients_per_region {
+            for &(protocol, config) in &configs {
+                // check that we have the correct number of server machines
+                assert_eq!(
+                    machines.server_count(),
+                    config.n() * config.shards(),
+                    "not enough server machines"
+                );
+
+                // check that we have the correct number of client machines
+                assert_eq!(
+                    machines.client_count(),
+                    config.n(),
+                    "not enough client machines"
+                );
+
+                // maybe skip configuration
+                if skip(protocol, config, clients) {
+                    continue;
+                }
+                run_experiment(
+                    &machines,
+                    run_mode,
+                    features.clone(),
+                    testbed,
+                    &planet,
+                    protocol,
+                    config,
+                    tracer_show_interval,
+                    clients,
+                    workload,
+                    &results_dir,
+                )
+                .await?;
             }
-            run_experiment(
-                &machines,
-                run_mode,
-                features.clone(),
-                testbed,
-                &planet,
-                protocol,
-                config,
-                tracer_show_interval,
-                clients,
-                workload,
-                &results_dir,
-            )
-            .await?;
         }
     }
     Ok(())
@@ -102,7 +117,7 @@ async fn run_experiment(
 
     // create experiment config and pull metrics
     let exp_config = ExperimentConfig::new(
-        machines.regions().clone(),
+        machines.placement().clone(),
         planet.clone(),
         run_mode,
         features,
@@ -133,54 +148,61 @@ async fn start_processes(
     protocol: Protocol,
     config: Config,
     tracer_show_interval: Option<usize>,
-) -> Result<(Ips, HashMap<Region, tokio::process::Child>), Report> {
-    let n = config.n();
-    // check that we have the correct number of regions and vms
-    assert_eq!(machines.region_count(), n);
-    assert_eq!(machines.server_count(), n);
-
+) -> Result<(Ips, HashMap<ProcessId, (Region, tokio::process::Child)>), Report>
+{
     let ips: Ips = machines
         .servers()
-        .map(|(region, vm)| (region.clone(), vm.public_ip.clone()))
+        .map(|(process_id, vm)| (*process_id, vm.public_ip.clone()))
         .collect();
     tracing::debug!("processes ips: {:?}", ips);
-    let all_but_self = |region: &Region| {
+    let all_but_self = |process_id: &ProcessId| {
         // select all ips but self
         ips.iter()
-            .filter(|(ip_region, _ip)| ip_region != &region)
+            .filter(|(ip_id, _ip)| ip_id != &process_id)
             .collect::<Vec<_>>()
     };
 
-    let mut processes = HashMap::with_capacity(n);
-    let mut wait_processes = Vec::with_capacity(n);
+    let process_count = config.n() * config.shards();
+    let mut processes = HashMap::with_capacity(process_count);
+    let mut wait_processes = Vec::with_capacity(process_count);
 
-    for (from_region, &process_id) in machines.regions() {
-        let vm = machines.server(from_region);
+    for ((from_region, shard_id), (process_id, _region_index)) in
+        machines.placement()
+    {
+        let vm = machines.server(process_id);
 
         // set sorted if on baremetal and no delay will be injected
         let set_sorted = testbed == Testbed::Baremetal && planet.is_none();
         let sorted = if set_sorted {
-            Some(
-                (process_id..=(n as ProcessId))
-                    .chain(1..process_id)
-                    .collect(),
-            )
+            Some(machines.sorted_processes(
+                config.shards(),
+                config.n(),
+                *process_id,
+            ))
         } else {
             None
         };
 
         // get ips for this region
-        let ips = all_but_self(from_region)
+        let ips = all_but_self(process_id)
             .into_iter()
-            .map(|(to_region, ip)| {
+            .map(|(to_process_id, ip)| {
+                let to_region = machines.process_region(to_process_id);
                 let delay = maybe_inject_delay(from_region, to_region, planet);
                 (ip.clone(), delay)
             })
             .collect();
 
         // create protocol config and generate args
-        let mut protocol_config =
-            ProtocolConfig::new(protocol, process_id, config, sorted, ips);
+        let mut protocol_config = ProtocolConfig::new(
+            protocol,
+            *process_id,
+            *shard_id,
+            config,
+            sorted,
+            ips,
+            METRICS_FILE,
+        );
         if let Some(interval) = tracer_show_interval {
             protocol_config.set_tracer_show_interval(interval);
         }
@@ -195,7 +217,7 @@ async fn start_processes(
         let process = util::vm_prepare_command(&vm, command)
             .spawn()
             .wrap_err("failed to start process")?;
-        processes.insert(from_region.clone(), process);
+        processes.insert(*process_id, (from_region.clone(), process));
 
         wait_processes.push(wait_process_started(process_id, &vm));
     }
@@ -220,8 +242,7 @@ fn maybe_inject_delay(
             .ping_latency(from, to)
             .expect("both regions should be part of the planet");
         // the delay should be half the ping latency
-        let delay = (ping / 2) as usize;
-        delay
+        (ping / 2) as usize
     })
 }
 
@@ -235,21 +256,31 @@ async fn run_clients(
     let mut wait_clients = Vec::with_capacity(machines.client_count());
 
     for (region, vm) in machines.clients() {
-        // find process id
-        let process_id = machines.process_id(region);
+        // find all processes in this region (we have more than one there's more
+        // than one shard)
+        let (processes_in_region, region_index) =
+            machines.processes_in_region(region);
 
         // compute id start and id end:
         // - first compute the id end
         // - and then compute id start: subtract `clients_per_machine` and add 1
-        let id_end = process_id as usize * clients_per_region;
+        let id_end = region_index as usize * clients_per_region;
         let id_start = id_end - clients_per_region + 1;
 
-        // get ip for this region
-        let ip = process_ips.get(region).expect("get process ip").clone();
+        // get ips of all processes in this region
+        let ips = processes_in_region
+            .iter()
+            .map(|process_id| {
+                process_ips
+                    .get(process_id)
+                    .expect("process should have ip")
+                    .clone()
+            })
+            .collect();
 
         // create client config and generate args
         let client_config =
-            ClientConfig::new(id_start, id_end, ip, workload, METRICS_FILE);
+            ClientConfig::new(id_start, id_end, ips, workload, METRICS_FILE);
         let args = client_config.to_args();
 
         let command = exp::fantoch_bin_script(
@@ -262,9 +293,9 @@ async fn run_clients(
         let client = util::vm_prepare_command(&vm, command)
             .spawn()
             .wrap_err("failed to start client")?;
-        clients.insert(process_id, client);
+        clients.insert(region_index, client);
 
-        wait_clients.push(wait_client_ended(process_id, region.clone(), &vm));
+        wait_clients.push(wait_client_ended(region_index, region.clone(), &vm));
     }
 
     // wait all clients ended
@@ -278,20 +309,19 @@ async fn stop_processes(
     machines: &Machines<'_>,
     run_mode: RunMode,
     exp_dir: String,
-    processes: HashMap<Region, tokio::process::Child>,
+    processes: HashMap<ProcessId, (Region, tokio::process::Child)>,
 ) -> Result<(), Report> {
     let mut wait_processes = Vec::with_capacity(machines.server_count());
-    for (region, mut pchild) in processes {
+    for (process_id, (region, mut pchild)) in processes {
         // find process id and vm
-        let process_id = machines.process_id(&region);
-        let vm = machines.server(&region);
+        let vm = machines.server(&process_id);
 
         // kill ssh process
         if let Err(e) = pchild.kill() {
             tracing::warn!(
-                "error trying to kill ssh process {} in region {:?}: {:?}",
+                "error trying to kill ssh process {} with pid {}: {:?}",
+                process_id,
                 pchild.id(),
-                region,
                 e
             );
         }
@@ -343,7 +373,7 @@ async fn stop_processes(
 }
 
 async fn wait_process_started(
-    process_id: ProcessId,
+    process_id: &ProcessId,
     vm: &tsunami::Machine<'_>,
 ) -> Result<(), Report> {
     // small delay between calls
@@ -369,7 +399,7 @@ async fn wait_process_ended(
     region: Region,
     vm: &tsunami::Machine<'_>,
     run_mode: RunMode,
-    exp_dir: &String,
+    exp_dir: &str,
 ) -> Result<(), Report> {
     // small delay between calls
     let duration = tokio::time::Duration::from_secs(2);
@@ -399,7 +429,7 @@ async fn wait_process_ended(
         while count != 0 {
             tokio::time::delay_for(duration).await;
             let command =
-                format!("ps -aux | grep flamegraph | grep -v grep | wc -l");
+                "ps -aux | grep flamegraph | grep -v grep | wc -l".to_string();
             let stdout =
                 util::vm_exec(vm, &command).await.wrap_err("ps | wc")?;
             if stdout.is_empty() {
@@ -411,7 +441,7 @@ async fn wait_process_ended(
 
         // once the flamegraph process is not running, we can grab the
         // flamegraph file
-        pull_flamegraph_file("server", &region, vm, exp_dir)
+        pull_flamegraph_file(Some(process_id), &region, vm, exp_dir)
             .await
             .wrap_err("pull_flamegraph_file")?;
     }
@@ -419,7 +449,7 @@ async fn wait_process_ended(
 }
 
 async fn wait_client_ended(
-    process_id: ProcessId,
+    region_index: RegionIndex,
     region: Region,
     vm: &tsunami::Machine<'_>,
 ) -> Result<(), Report> {
@@ -440,7 +470,7 @@ async fn wait_client_ended(
 
     tracing::info!(
         "client {} in region {:?} terminated successfully",
-        process_id,
+        region_index,
         region
     );
 
@@ -555,25 +585,12 @@ async fn pull_metrics(
     tracing::info!("experiment metrics will be saved in {}", exp_dir);
 
     let mut pulls = Vec::with_capacity(machines.vm_count());
-    for (region, vm) in machines.servers() {
-        let pull_metrics = false;
-        pulls.push(pull_metrics_files(
-            "server",
-            region,
-            vm,
-            &exp_dir,
-            pull_metrics,
-        ));
+    for (process_id, vm) in machines.servers() {
+        let region = machines.process_region(process_id);
+        pulls.push(pull_metrics_files(Some(*process_id), region, vm, &exp_dir));
     }
     for (region, vm) in machines.clients() {
-        let pull_metrics = true;
-        pulls.push(pull_metrics_files(
-            "client",
-            region,
-            vm,
-            &exp_dir,
-            pull_metrics,
-        ));
+        pulls.push(pull_metrics_files(None, region, vm, &exp_dir));
     }
 
     // pull all metrics in parallel
@@ -611,54 +628,62 @@ fn exp_timestamp() -> u128 {
 }
 
 async fn pull_metrics_files(
-    tag: &str,
+    process_id: Option<ProcessId>,
     region: &Region,
     vm: &tsunami::Machine<'_>,
-    exp_dir: &String,
-    pull_metrics: bool,
+    exp_dir: &str,
 ) -> Result<(), Report> {
+    // compute filename prefix
+    let prefix = crate::config::file_prefix(process_id, region);
+
     // pull log file and remove it
-    let local_path = format!("{}/{}_{:?}.log", exp_dir, tag, region);
+    let local_path = format!("{}/{}.log", exp_dir, prefix);
     util::copy_from((LOG_FILE, vm), local_path)
         .await
         .wrap_err("copy log")?;
 
     // pull dstat and remove it
-    let local_path = format!("{}/{}_{:?}_dstat.csv", exp_dir, tag, region);
+    let local_path = format!("{}/{}_dstat.csv", exp_dir, prefix);
     util::copy_from((DSTAT_FILE, vm), local_path)
         .await
         .wrap_err("copy dstat")?;
 
+    // pull metrics file and remove it
+    let local_path = format!("{}/{}_metrics.bincode", exp_dir, prefix);
+    util::copy_from((METRICS_FILE, vm), local_path)
+        .await
+        .wrap_err("copy metrics")?;
+
     // files to be removed
-    let mut to_remove = format!("rm {} {}", LOG_FILE, DSTAT_FILE);
-
-    if pull_metrics {
-        // pull metrics file and remove it
-        let local_path =
-            format!("{}/{}_{:?}_metrics.bincode", exp_dir, tag, region);
-        util::copy_from((METRICS_FILE, vm), local_path)
-            .await
-            .wrap_err("copy metrics")?;
-
-        // also remove metrics file
-        to_remove = format!("{} {}", to_remove, METRICS_FILE);
-    }
+    let to_remove = format!("rm {} {} {}", LOG_FILE, DSTAT_FILE, METRICS_FILE);
 
     // remove files
     util::vm_exec(vm, to_remove)
         .await
         .wrap_err("remove files")?;
 
+    if let Some(process_id) = process_id {
+        tracing::info!(
+            "all process {:?} metric files pulled in region {:?}",
+            process_id,
+            region
+        );
+    } else {
+        tracing::info!("all client metric files pulled in region {:?}", region);
+    }
+
     Ok(())
 }
 
 async fn pull_flamegraph_file(
-    tag: &str,
+    process_id: Option<ProcessId>,
     region: &Region,
     vm: &tsunami::Machine<'_>,
-    exp_dir: &String,
+    exp_dir: &str,
 ) -> Result<(), Report> {
-    let local_path = format!("{}/{}_{:?}_flamegraph.svg", exp_dir, tag, region);
+    // compute filename prefix
+    let prefix = crate::config::file_prefix(process_id, region);
+    let local_path = format!("{}/{}_flamegraph.svg", exp_dir, prefix);
     util::copy_from(("flamegraph.svg", vm), local_path)
         .await
         .wrap_err("copy flamegraph")?;
