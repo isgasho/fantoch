@@ -35,6 +35,7 @@ stop_fantoch() {
 
     # stop dstat
     cmd="ps -aux | grep dstat | grep -v grep | awk '{ print \"kill -SIGKILL \"\$2 }' | bash"
+    ssh "${SSH_ARGS}" ${machine} "${cmd}" </dev/null
 
     # wait for processes to end
     cmd="lsof -i :${PORT} -i :${CLIENT_PORT} | wc -l"
@@ -44,6 +45,10 @@ stop_fantoch() {
         running=$(ssh "${SSH_ARGS}" ${machine} "${cmd}" </dev/null | xargs)
         sleep 1
     done
+
+    # remove files
+    cmd="rm -f .metrics .log .metrics dstat.csv heaptrack.*.gz"
+    ssh "${SSH_ARGS}" ${machine} "${cmd}" </dev/null
 }
 
 stop_all() {

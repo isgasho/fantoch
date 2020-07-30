@@ -14,7 +14,7 @@ use std::fs::DirEntry;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-const SNAPSHOT_SUFFIX: &str = "_experiment_data_snapshot.bincode";
+const SNAPSHOT_SUFFIX: &str = "_experiment_data_snapshot.bincode.gz";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ResultsDB {
@@ -73,7 +73,7 @@ impl ResultsDB {
         loaded_entries: Arc<Mutex<usize>>,
         total_entries: usize,
     ) -> Result<(ExperimentConfig, ExperimentData), Report> {
-        println!("start loading {:?}", timestamp.path().display());
+        // register load start time
         let start = std::time::Instant::now();
 
         // read the configuration of this experiment
@@ -90,7 +90,7 @@ impl ResultsDB {
             format!("{}{}", timestamp.path().display(), SNAPSHOT_SUFFIX);
         let exp_data = if Path::new(&snapshot).exists() {
             // if there is, simply load it
-            fantoch_exp::deserialize(&snapshot, SerializationFormat::Bincode)
+            fantoch_exp::deserialize(&snapshot, SerializationFormat::BincodeGz)
                 .wrap_err_with(|| {
                     format!("deserialize experiment data snapshot {}", snapshot)
                 })?
@@ -101,7 +101,7 @@ impl ResultsDB {
             fantoch_exp::serialize(
                 &exp_data,
                 &snapshot,
-                SerializationFormat::Bincode,
+                SerializationFormat::BincodeGz,
             )
             .wrap_err_with(|| {
                 format!("deserialize experiment data snapshot {}", snapshot)
@@ -116,19 +116,16 @@ impl ResultsDB {
             .expect("locking loaded entries should work");
         *loaded_entries += 1;
         println!(
-            "done loading {:?} | {} of {} | load time {}s",
+            "loaded {:?} after {:?} | {} of {}",
             timestamp.path().display(),
+            start.elapsed(),
             loaded_entries,
             total_entries,
-            start.elapsed().as_secs()
         );
         Ok((exp_config, exp_data))
     }
 
-    pub fn find(
-        &mut self,
-        search: Search,
-    ) -> Result<Vec<&ExperimentData>, Report> {
+    pub fn find(&self, search: Search) -> Result<Vec<&ExperimentData>, Report> {
         let filtered = self
             .results
             .iter()
@@ -233,6 +230,19 @@ impl ResultsDB {
         let global_client_metrics =
             Self::global_client_metrics(&client_metrics);
 
+        // client dstats (need to be after processing client metrics so that we
+        // have a `start` and an `end` for pruning)
+        let mut client_dstats = HashMap::new();
+
+        for (region, _, _, _) in exp_config.placement.iter() {
+            // create client file prefix
+            let prefix = fantoch_exp::config::file_prefix(None, region);
+
+            // load this region's client dstat
+            let client = Self::load_dstat(&timestamp, prefix, start, end)?;
+            client_dstats.insert(region.clone(), client);
+        }
+
         // process metrics and dstats
         let mut process_metrics = HashMap::new();
         let mut process_dstats = HashMap::new();
@@ -261,6 +271,7 @@ impl ResultsDB {
             process_metrics,
             process_dstats,
             client_metrics,
+            client_dstats,
             global_client_metrics,
         ))
     }
@@ -273,12 +284,12 @@ impl ResultsDB {
         T: serde::de::DeserializeOwned,
     {
         let path = format!(
-            "{}/{}_metrics.bincode",
+            "{}/{}_metrics.bincode.gz",
             timestamp.path().display(),
             prefix,
         );
         let metrics =
-            fantoch_exp::deserialize(&path, SerializationFormat::Bincode)
+            fantoch_exp::deserialize(&path, SerializationFormat::BincodeGz)
                 .wrap_err_with(|| format!("deserialize metrics {}", path))?;
         Ok(metrics)
     }

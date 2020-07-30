@@ -40,16 +40,16 @@ where
     A: ToSocketAddrs + Debug,
     P: Protocol + 'static,
 {
-    // check that (n * shards) - 1 addresses were set
-    let total = config.n() * config.shards();
+    // check that (n-1 + shards-1) addresses were set
+    let total = config.n() - 1 + config.shards() - 1;
     assert_eq!(
         addresses.len(),
-        total - 1,
-        "addresses count should be (n * shards) - 1"
+        total,
+        "addresses count should be (n-1 + shards-1)"
     );
 
     // compute the number of expected connections
-    let total_connections = (total - 1) * multiplexing;
+    let total_connections = total * multiplexing;
 
     // spawn listener
     let mut from_listener = task::spawn_producer(channel_buffer_size, |tx| {
@@ -302,6 +302,7 @@ async fn reader_task<P>(
             }
             None => {
                 println!("[reader] error receiving message from connection");
+                break;
             }
         }
     }
@@ -366,7 +367,7 @@ pub fn start_processes<P, R>(
     to_writers: HashMap<ProcessId, Vec<WriterSender<P>>>,
     reader_to_workers: ReaderToWorkers<P>,
     worker_to_executors: WorkerToExecutors<P>,
-    channel_buffer_size: usize,
+    process_channel_buffer_size: usize,
     execution_log: Option<String>,
     to_metrics_logger: Option<ProtocolMetricsSender>,
 ) -> Vec<JoinHandle<()>>
@@ -389,7 +390,7 @@ where
 
     let to_execution_logger = execution_log.map(|execution_log| {
         // if the execution log was set, then start the execution logger
-        let mut tx = task::spawn_consumer(channel_buffer_size, |rx| {
+        let mut tx = task::spawn_consumer(process_channel_buffer_size, |rx| {
             execution_logger::execution_logger_task::<P>(execution_log, rx)
         });
         tx.set_name("to_execution_logger");
@@ -590,6 +591,7 @@ async fn handle_actions<P>(
                 // prevent unnecessary cloning of messages, since send only
                 // requires a reference to the message
                 let msg_to_send = Arc::new(msg.clone());
+
                 // send to writers in parallel
                 let mut sends = to_writers
                     .iter_mut()
@@ -618,8 +620,6 @@ async fn handle_actions<P>(
                     )
                     .await;
                     actions.extend(new_actions);
-                } else {
-                    break;
                 }
             }
             Action::ToForward { msg } => {

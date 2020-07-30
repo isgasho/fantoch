@@ -34,7 +34,7 @@ pub async fn bench_experiment(
     results_dir: impl AsRef<Path>,
 ) -> Result<(), Report> {
     if tracer_show_interval.is_some() {
-        panic!("vitor: you should set the timing feature for this to work!");
+        panic!("vitor: you should set the 'prof' feature for this to work!");
     }
 
     for workload in workloads {
@@ -155,43 +155,45 @@ async fn start_processes(
         .map(|(process_id, vm)| (*process_id, vm.public_ip.clone()))
         .collect();
     tracing::debug!("processes ips: {:?}", ips);
-    let all_but_self = |process_id: &ProcessId| {
-        // select all ips but self
-        ips.iter()
-            .filter(|(ip_id, _ip)| ip_id != &process_id)
-            .collect::<Vec<_>>()
-    };
 
     let process_count = config.n() * config.shards();
     let mut processes = HashMap::with_capacity(process_count);
     let mut wait_processes = Vec::with_capacity(process_count);
 
-    for ((from_region, shard_id), (process_id, _region_index)) in
+    for ((from_region, shard_id), (process_id, region_index)) in
         machines.placement()
     {
         let vm = machines.server(process_id);
 
-        // set sorted if on baremetal and no delay will be injected
-        let set_sorted = testbed == Testbed::Baremetal && planet.is_none();
-        let sorted = if set_sorted {
-            Some(machines.sorted_processes(
-                config.shards(),
-                config.n(),
-                *process_id,
-            ))
-        } else {
-            None
-        };
+        // compute the set of sorted processes
+        let sorted = machines.sorted_processes(
+            config.shards(),
+            config.n(),
+            *process_id,
+            *shard_id,
+            *region_index,
+        );
 
-        // get ips for this region
-        let ips = all_but_self(process_id)
-            .into_iter()
-            .map(|(to_process_id, ip)| {
-                let to_region = machines.process_region(to_process_id);
+        // get ips to connect to (based on sorted)
+        let ips = sorted
+            .iter()
+            .filter(|peer_id| *peer_id != process_id)
+            .map(|peer_id| {
+                // get process ip
+                let ip = ips
+                    .get(peer_id)
+                    .expect("all processes should have an ip")
+                    .clone();
+                // compute delay to be injected (if theres's a `planet`)
+                let to_region = machines.process_region(peer_id);
                 let delay = maybe_inject_delay(from_region, to_region, planet);
-                (ip.clone(), delay)
+                (ip, delay)
             })
             .collect();
+
+        // set sorted only if on baremetal and no delay will be injected
+        let set_sorted = testbed == Testbed::Baremetal && planet.is_none();
+        let sorted = if set_sorted { Some(sorted) } else { None };
 
         // create protocol config and generate args
         let mut protocol_config = ProtocolConfig::new(
@@ -422,28 +424,41 @@ async fn wait_process_ended(
         region
     );
 
-    // pull flamegraph if in flamegraph mode
-    if run_mode == RunMode::Flamegraph {
-        // wait for the flamegraph process to finish writing the flamegraph file
-        let mut count = 1;
-        while count != 0 {
-            tokio::time::delay_for(duration).await;
-            let command =
-                "ps -aux | grep flamegraph | grep -v grep | wc -l".to_string();
-            let stdout =
-                util::vm_exec(vm, &command).await.wrap_err("ps | wc")?;
-            if stdout.is_empty() {
-                tracing::warn!("empty output from: {}", command);
-            } else {
-                count = stdout.parse::<usize>().wrap_err("lsof | wc parse")?;
-            }
+    // pull aditional files
+    match run_mode {
+        RunMode::Release => {
+            // nothing to do in this case
         }
+        RunMode::Flamegraph => {
+            // wait for the flamegraph process to finish writing the flamegraph
+            // file
+            let mut count = 1;
+            while count != 0 {
+                tokio::time::delay_for(duration).await;
+                let command =
+                    "ps -aux | grep flamegraph | grep -v grep | wc -l"
+                        .to_string();
+                let stdout =
+                    util::vm_exec(vm, &command).await.wrap_err("ps | wc")?;
+                if stdout.is_empty() {
+                    tracing::warn!("empty output from: {}", command);
+                } else {
+                    count =
+                        stdout.parse::<usize>().wrap_err("lsof | wc parse")?;
+                }
+            }
 
-        // once the flamegraph process is not running, we can grab the
-        // flamegraph file
-        pull_flamegraph_file(Some(process_id), &region, vm, exp_dir)
-            .await
-            .wrap_err("pull_flamegraph_file")?;
+            // once the flamegraph process is not running, we can grab the
+            // flamegraph file
+            pull_flamegraph_file(Some(process_id), &region, vm, exp_dir)
+                .await
+                .wrap_err("pull_flamegraph_file")?;
+        }
+        RunMode::Heaptrack => {
+            pull_heaptrack_file(Some(process_id), &region, vm, exp_dir)
+                .await
+                .wrap_err("pull_heaptrack_file")?;
+        }
     }
     Ok(())
 }
@@ -585,10 +600,12 @@ async fn pull_metrics(
     tracing::info!("experiment metrics will be saved in {}", exp_dir);
 
     let mut pulls = Vec::with_capacity(machines.vm_count());
+    // prepare server metrics pull
     for (process_id, vm) in machines.servers() {
         let region = machines.process_region(process_id);
         pulls.push(pull_metrics_files(Some(*process_id), region, vm, &exp_dir));
     }
+    // prepare client metrics pull
     for (region, vm) in machines.clients() {
         pulls.push(pull_metrics_files(None, region, vm, &exp_dir));
     }
@@ -649,15 +666,13 @@ async fn pull_metrics_files(
         .wrap_err("copy dstat")?;
 
     // pull metrics file and remove it
-    let local_path = format!("{}/{}_metrics.bincode", exp_dir, prefix);
+    let local_path = format!("{}/{}_metrics.bincode.gz", exp_dir, prefix);
     util::copy_from((METRICS_FILE, vm), local_path)
         .await
         .wrap_err("copy metrics")?;
 
-    // files to be removed
+    // remove metric files
     let to_remove = format!("rm {} {} {}", LOG_FILE, DSTAT_FILE, METRICS_FILE);
-
-    // remove files
     util::vm_exec(vm, to_remove)
         .await
         .wrap_err("remove files")?;
@@ -681,11 +696,47 @@ async fn pull_flamegraph_file(
     vm: &tsunami::Machine<'_>,
     exp_dir: &str,
 ) -> Result<(), Report> {
+    // flamegraph will always generate a file with this name
+    let flamegraph = "flamegraph.svg";
+
     // compute filename prefix
     let prefix = crate::config::file_prefix(process_id, region);
     let local_path = format!("{}/{}_flamegraph.svg", exp_dir, prefix);
-    util::copy_from(("flamegraph.svg", vm), local_path)
+    util::copy_from((flamegraph, vm), local_path)
         .await
         .wrap_err("copy flamegraph")?;
+
+    // remove flamegraph file
+    let command = format!("rm {}", flamegraph);
+    util::vm_exec(vm, command)
+        .await
+        .wrap_err("remove flamegraph ile")?;
+    Ok(())
+}
+
+async fn pull_heaptrack_file(
+    process_id: Option<ProcessId>,
+    region: &Region,
+    vm: &tsunami::Machine<'_>,
+    exp_dir: &str,
+) -> Result<(), Report> {
+    // find heaptrack file, which will be something like:
+    // "heaptrack.newt_atomic.18836.gz
+    let command = format!("ls heaptrack.*.gz");
+    let heaptrack =
+        util::vm_exec(vm, command).await.wrap_err("ls heaptrack")?;
+
+    // compute filename prefix
+    let prefix = crate::config::file_prefix(process_id, region);
+    let local_path = format!("{}/{}_heaptrack.gz", exp_dir, prefix);
+    util::copy_from((&heaptrack, vm), local_path)
+        .await
+        .wrap_err("copy heaptrack")?;
+
+    // remove heaptrack file
+    let command = format!("rm {}", heaptrack);
+    util::vm_exec(vm, command)
+        .await
+        .wrap_err("remove heaptrack file")?;
     Ok(())
 }

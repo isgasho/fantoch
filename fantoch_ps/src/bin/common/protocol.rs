@@ -2,6 +2,7 @@ use clap::{App, Arg};
 use fantoch::config::Config;
 use fantoch::id::{ProcessId, ShardId};
 use fantoch::protocol::Protocol;
+use jemallocator::Jemalloc;
 use std::error::Error;
 use std::net::IpAddr;
 use std::time::Duration;
@@ -24,13 +25,17 @@ const DEFAULT_MULTIPLEXING: usize = 1;
 
 // newt's config
 const DEFAULT_NEWT_TINY_QUORUMS: bool = false;
-const DEFAULT_NEWT_CLOCK_BUMP_INTERVAL: usize = 10;
+const DEFAULT_NEWT_DETACHED_SEND_INTERVAL: Duration = Duration::from_millis(5);
 
 // protocol's config
 const DEFAULT_SKIP_FAST_ACK: bool = false;
 
 #[global_allocator]
-static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+#[cfg(not(feature = "prof"))]
+static ALLOC: Jemalloc = Jemalloc;
+#[cfg(feature = "prof")]
+static ALLOC: fantoch_prof::AllocProf<Jemalloc> =
+    fantoch_prof::AllocProf::new();
 
 type ProtocolArgs = (
     ProcessId,
@@ -44,6 +49,7 @@ type ProtocolArgs = (
     bool,
     usize,
     Option<usize>,
+    usize,
     usize,
     usize,
     usize,
@@ -71,7 +77,8 @@ where
         tcp_nodelay,
         tcp_buffer_size,
         tcp_flush_interval,
-        channel_buffer_size,
+        process_channel_buffer_size,
+        client_channel_buffer_size,
         workers,
         executors,
         multiplexing,
@@ -93,7 +100,8 @@ where
         tcp_nodelay,
         tcp_buffer_size,
         tcp_flush_interval,
-        channel_buffer_size,
+        process_channel_buffer_size,
+        client_channel_buffer_size,
         workers,
         executors,
         multiplexing,
@@ -225,7 +233,14 @@ fn parse_args() -> ProtocolArgs {
             Arg::with_name("newt_clock_bump_interval")
                 .long("newt_clock_bump_interval")
                 .value_name("NEWT_CLOCK_BUMP_INTERVAL")
-                .help("number indicating the interval (in milliseconds) between clock bump; if this value is not set, then clocks are not bumped periodically")
+                .help("number indicating the interval (in milliseconds) between clock bumps; if this value is not set, then clocks are not bumped periodically")
+                .takes_value(true),
+        )
+        .arg(
+            Arg::with_name("newt_detached_send_interval")
+                .long("newt_detached_send_interval")
+                .value_name("NEWT_DETACHED_SEND_INTERVAL")
+                .help("number indicating the interval (in milliseconds) between mdetached messages are sent; default: 5")
                 .takes_value(true),
         )
         .arg(
@@ -257,11 +272,20 @@ fn parse_args() -> ProtocolArgs {
                 .takes_value(true),
         )
         .arg(
-            Arg::with_name("channel_buffer_size")
-                .long("channel_buffer_size")
-                .value_name("CHANNEL_BUFFER_SIZE")
+            Arg::with_name("process_channel_buffer_size")
+                .long("process_channel_buffer_size")
+                .value_name("PROCESS_CHANNEL_BUFFER_SIZE")
                 .help(
-                    "size of the buffer in each channel used for task communication; default: 100",
+                    "size of the buffer in each channel used for task communication related to the processes; default: 100",
+                )
+                .takes_value(true),
+        )
+        .arg(
+            Arg::with_name("client_channel_buffer_size")
+                .long("client_channel_buffer_size")
+                .value_name("CLIENT_CHANNEL_BUFFER_SIZE")
+                .help(
+                    "size of the buffer in each channel used for task communication related to the clients; default: 100",
                 )
                 .takes_value(true),
         )
@@ -339,6 +363,9 @@ fn parse_args() -> ProtocolArgs {
         parse_newt_clock_bump_interval(
             matches.value_of("newt_clock_bump_interval"),
         ),
+        parse_newt_detached_send_interval(
+            matches.value_of("newt_detached_send_interval"),
+        ),
         parse_skip_fast_ack(matches.value_of("skip_fast_ack")),
     );
 
@@ -348,8 +375,11 @@ fn parse_args() -> ProtocolArgs {
     let tcp_flush_interval =
         super::parse_tcp_flush_interval(matches.value_of("tcp_flush_interval"));
 
-    let channel_buffer_size = super::parse_channel_buffer_size(
-        matches.value_of("channel_buffer_size"),
+    let process_channel_buffer_size = super::parse_channel_buffer_size(
+        matches.value_of("process_channel_buffer_size"),
+    );
+    let client_channel_buffer_size = super::parse_channel_buffer_size(
+        matches.value_of("client_channel_buffer_size"),
     );
     let workers = parse_workers(matches.value_of("workers"));
     let executors = parse_executors(matches.value_of("executors"));
@@ -370,7 +400,14 @@ fn parse_args() -> ProtocolArgs {
     println!("tcp_nodelay: {:?}", tcp_nodelay);
     println!("tcp buffer size: {:?}", tcp_buffer_size);
     println!("tcp flush interval: {:?}", tcp_flush_interval);
-    println!("channel buffer size: {:?}", channel_buffer_size);
+    println!(
+        "process channel buffer size: {:?}",
+        process_channel_buffer_size
+    );
+    println!(
+        "client channel buffer size: {:?}",
+        client_channel_buffer_size
+    );
     println!("workers: {:?}", workers);
     println!("executors: {:?}", executors);
     println!("multiplexing: {:?}", multiplexing);
@@ -378,14 +415,6 @@ fn parse_args() -> ProtocolArgs {
     println!("trace_show_interval: {:?}", tracer_show_interval);
     println!("ping_interval: {:?}", ping_interval);
     println!("metrics file: {:?}", metrics_file);
-
-    // check that the number of sorted processes equals `n` (if it was set)
-    if let Some(sorted_processes) = &sorted_processes {
-        assert_eq!(sorted_processes.len(), config.n());
-    }
-
-    // check that the number of addresses equals `(n * shards) - 1`
-    assert_eq!(addresses.len(), (config.n() * config.shards()) - 1);
 
     (
         process_id,
@@ -399,7 +428,8 @@ fn parse_args() -> ProtocolArgs {
         tcp_nodelay,
         tcp_buffer_size,
         tcp_flush_interval,
-        channel_buffer_size,
+        process_channel_buffer_size,
+        client_channel_buffer_size,
         workers,
         executors,
         multiplexing,
@@ -498,6 +528,7 @@ pub fn build_config(
     leader: Option<ProcessId>,
     newt_tiny_quorums: bool,
     newt_clock_bump_interval: Option<Duration>,
+    newt_detached_send_interval: Duration,
     skip_fast_ack: bool,
 ) -> Config {
     // create config
@@ -517,6 +548,7 @@ pub fn build_config(
     if let Some(interval) = newt_clock_bump_interval {
         config.set_newt_clock_bump_interval(interval);
     }
+    config.set_newt_detached_send_interval(newt_detached_send_interval);
     // set protocol's config
     config.set_skip_fast_ack(skip_fast_ack);
     config
@@ -595,6 +627,20 @@ fn parse_newt_clock_bump_interval(
         Duration::from_millis(ms)
     })
 }
+
+fn parse_newt_detached_send_interval(
+    newt_detached_send_interval: Option<&str>,
+) -> Duration {
+    newt_detached_send_interval
+        .map(|newt_detached_send_interval| {
+            let ms = newt_detached_send_interval
+                .parse::<u64>()
+                .expect("newt_detached_send_interval should be a number");
+            Duration::from_millis(ms)
+        })
+        .unwrap_or(DEFAULT_NEWT_DETACHED_SEND_INTERVAL)
+}
+
 pub fn parse_skip_fast_ack(skip_fast_ack: Option<&str>) -> bool {
     skip_fast_ack
         .map(|skip_fast_ack| {

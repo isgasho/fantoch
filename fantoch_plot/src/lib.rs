@@ -8,7 +8,9 @@ mod plot;
 pub use db::{ExperimentData, ResultsDB, Search};
 pub use fmt::PlotFmt;
 
+use color_eyre::eyre::WrapErr;
 use color_eyre::Report;
+use fantoch::id::ProcessId;
 use plot::axes::Axes;
 use plot::figure::Figure;
 use plot::pyplot::PyPlot;
@@ -67,6 +69,22 @@ pub enum Style {
     LineWidth,
 }
 
+pub enum DstatType {
+    Process(ProcessId),
+    ProcessGlobal,
+    ClientGlobal,
+}
+
+impl DstatType {
+    pub fn name(&self) -> String {
+        match self {
+            Self::Process(process_id) => format!("process_{}", process_id),
+            Self::ProcessGlobal => String::from("process_global"),
+            Self::ClientGlobal => String::from("client_global"),
+        }
+    }
+}
+
 enum AxisToScale {
     X,
     Y,
@@ -103,8 +121,9 @@ pub fn latency_plot<R>(
     style_fun: Option<Box<dyn Fn(&Search) -> HashMap<Style, String>>>,
     n: usize,
     error_bar: ErrorBar,
+    output_dir: Option<&str>,
     output_file: &str,
-    db: &mut ResultsDB,
+    db: &ResultsDB,
     f: impl Fn(&ExperimentData) -> R,
 ) -> Result<Vec<(Search, R)>, Report> {
     const FULL_REGION_WIDTH: f64 = 10f64;
@@ -241,7 +260,7 @@ pub fn latency_plot<R>(
     add_legend(plotted, None, py, &ax)?;
 
     // end plot
-    end_plot(output_file, py, &plt, Some(fig))?;
+    end_plot(output_dir, output_file, py, &plt, Some(fig))?;
     Ok(results)
 }
 
@@ -249,8 +268,9 @@ pub fn latency_plot<R>(
 pub fn cdf_plot(
     searches: Vec<Search>,
     style_fun: Option<Box<dyn Fn(&Search) -> HashMap<Style, String>>>,
+    output_dir: Option<&str>,
     output_file: &str,
-    db: &mut ResultsDB,
+    db: &ResultsDB,
 ) -> Result<(), Report> {
     // start python
     let gil = Python::acquire_gil();
@@ -274,7 +294,7 @@ pub fn cdf_plot(
     add_legend(plotted, None, py, &ax)?;
 
     // end plot
-    end_plot(output_file, py, &plt, Some(fig))?;
+    end_plot(output_dir, output_file, py, &plt, Some(fig))?;
 
     Ok(())
 }
@@ -282,8 +302,9 @@ pub fn cdf_plot(
 pub fn cdf_plot_per_f(
     searches: Vec<Search>,
     style_fun: Option<Box<dyn Fn(&Search) -> HashMap<Style, String>>>,
+    output_dir: Option<&str>,
     output_file: &str,
-    db: &mut ResultsDB,
+    db: &ResultsDB,
 ) -> Result<(), Report> {
     let fs: BTreeSet<_> = searches.iter().map(|search| search.f).collect();
     let fs: Vec<_> = fs.into_iter().collect();
@@ -347,7 +368,7 @@ pub fn cdf_plot_per_f(
     }
 
     // end plot
-    end_plot(output_file, py, &plt, Some(fig))?;
+    end_plot(output_dir, output_file, py, &plt, Some(fig))?;
 
     Ok(())
 }
@@ -373,7 +394,7 @@ fn inner_cdf_plot(
     search: Search,
     style_fun: &Option<Box<dyn Fn(&Search) -> HashMap<Style, String>>>,
     plotted: &mut usize,
-    db: &mut ResultsDB,
+    db: &ResultsDB,
 ) -> Result<(), Report> {
     let mut exp_data = db.find(search)?;
     match exp_data.len() {
@@ -420,8 +441,9 @@ pub fn throughput_latency_plot(
     n: usize,
     clients_per_region: Vec<usize>,
     latency: LatencyMetric,
+    output_dir: Option<&str>,
     output_file: &str,
-    db: &mut ResultsDB,
+    db: &ResultsDB,
 ) -> Result<(), Report> {
     // start python
     let gil = Python::acquire_gil();
@@ -517,15 +539,17 @@ pub fn throughput_latency_plot(
     add_legend(plotted, None, py, &ax)?;
 
     // end plot
-    end_plot(output_file, py, &plt, Some(fig))?;
+    end_plot(output_dir, output_file, py, &plt, Some(fig))?;
 
     Ok(())
 }
 
 pub fn dstat_table(
     searches: Vec<Search>,
+    dstat_type: DstatType,
+    output_dir: Option<&str>,
     output_file: &str,
-    db: &mut ResultsDB,
+    db: &ResultsDB,
 ) -> Result<(), Report> {
     let col_labels = vec![
         "cpu_usr",
@@ -564,17 +588,30 @@ pub fn dstat_table(
         );
         row_labels.push(row_label);
 
+        // select the correct dstats depending on the `DstatType` chosen
+        let dstats = match dstat_type {
+            DstatType::Process(process_id) => {
+                match exp_data.process_dstats.get(&process_id) {
+                    Some(dstats) => dstats,
+                    None => {
+                        panic!("didn't found dstat for process {}", process_id)
+                    }
+                }
+            }
+            DstatType::ProcessGlobal => &exp_data.global_process_dstats,
+            DstatType::ClientGlobal => &exp_data.global_client_dstats,
+        };
         // fetch all cell data
-        let cpu_usr = exp_data.global_process_dstats.cpu_usr_mad();
-        let cpu_sys = exp_data.global_process_dstats.cpu_sys_mad();
-        let cpu_wait = exp_data.global_process_dstats.cpu_wait_mad();
-        let net_recv = exp_data.global_process_dstats.net_recv();
-        let net_send = exp_data.global_process_dstats.net_send_mad();
-        let mem_used = exp_data.global_process_dstats.mem_used_mad();
-
+        let cpu_usr = dstats.cpu_usr_mad();
+        let cpu_sys = dstats.cpu_sys_mad();
+        let cpu_wait = dstats.cpu_wait_mad();
+        let net_recv = dstats.net_recv_mad();
+        let net_send = dstats.net_send_mad();
+        let mem_used = dstats.mem_used_mad();
         // create cell
         let cell =
             vec![cpu_usr, cpu_sys, cpu_wait, net_recv, net_send, mem_used];
+        // format cell
         let fmt_cell_data = |mad: (_, _)| format!("{} ± {}", mad.0, mad.1);
         let cell: Vec<_> = cell.into_iter().map(fmt_cell_data).collect();
 
@@ -616,7 +653,7 @@ pub fn dstat_table(
         plt.tight_layout()?;
 
         // end plot
-        end_plot(output_file, py, &plt, None)?;
+        end_plot(output_dir, output_file, py, &plt, None)?;
     }
     Ok(())
 }
@@ -654,14 +691,24 @@ fn start_plot<'a>(
 }
 
 fn end_plot(
+    output_dir: Option<&str>,
     output_file: &str,
     py: Python<'_>,
     plt: &PyPlot<'_>,
     fig: Option<Figure<'_>>,
 ) -> Result<(), Report> {
+    // maybe save `output_file` in `output_dir` (if one was set)
+    let output_file = if let Some(output_dir) = output_dir {
+        // make sure `output_dir` exists
+        std::fs::create_dir_all(&output_dir).wrap_err("create plot dir")?;
+        format!("{}/{}", output_dir, output_file)
+    } else {
+        output_file.to_string()
+    };
+
     // save figure
     let kwargs = pydict!(py, ("format", "pdf"));
-    plt.savefig(output_file, Some(kwargs))?;
+    plt.savefig(&output_file, Some(kwargs))?;
 
     let kwargs = if let Some(fig) = fig {
         // close the figure passed as argument
@@ -671,7 +718,6 @@ fn end_plot(
         None
     };
     plt.close(kwargs)?;
-
     Ok(())
 }
 
