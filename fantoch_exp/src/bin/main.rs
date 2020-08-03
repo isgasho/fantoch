@@ -3,7 +3,9 @@ use color_eyre::Report;
 use fantoch::client::{KeyGen, ShardGen, Workload};
 use fantoch::config::Config;
 use fantoch::planet::Planet;
-use fantoch_exp::exp::Machines;
+use fantoch_exp::bench::ExperimentTimeouts;
+use fantoch_exp::machine::Machines;
+use fantoch_exp::progress::TracingProgressBar;
 use fantoch_exp::{FantochFeature, Protocol, RunMode, Testbed};
 use rusoto_core::Region;
 use std::time::Duration;
@@ -11,7 +13,17 @@ use tsunami::providers::aws::LaunchMode;
 use tsunami::Tsunami;
 
 // folder where all results will be stored
-const RESULTS_DIR: &str = "../partial_replication";
+const RESULTS_DIR: &str = "../cleanup";
+
+// timeouts
+const fn minutes(minutes: u64) -> Duration {
+    Duration::from_secs(3600 * minutes)
+}
+const EXPERIMENT_TIMEOUTS: ExperimentTimeouts = ExperimentTimeouts {
+    start: Some(minutes(20)),
+    run: Some(minutes(20)),
+    stop: Some(minutes(20)),
+};
 
 // aws experiment config
 const LAUCH_MODE: LaunchMode = LaunchMode::DefinedDuration { hours: 1 };
@@ -19,9 +31,6 @@ const SERVER_INSTANCE_TYPE: &str = "m5.4xlarge";
 // const SERVER_INSTANCE_TYPE: &str = "c5.2xlarge";
 const CLIENT_INSTANCE_TYPE: &str = "c5.2xlarge";
 const MAX_SPOT_INSTANCE_REQUEST_WAIT_SECS: u64 = 5 * 60; // 5 minutes
-
-// run mode
-const RUN_MODE: RunMode = RunMode::Release;
 
 // processes config
 const GC_INTERVAL: Option<Duration> = Some(Duration::from_millis(50));
@@ -33,11 +42,18 @@ const TRACER_SHOW_INTERVAL: Option<usize> = None;
 const COMMANDS_PER_CLIENT: usize = 500; // 500 if WAN, 500_000 if LAN
 const PAYLOAD_SIZE: usize = 0; // 0 if no bottleneck, 4096 if paxos bottleneck
 
-// bench-specific config
-const BRANCH: &str = "merge_past";
-// TODO allow more than one feature
-const FEATURE: Option<FantochFeature> = None;
-// const FEATURE: Option<FantochFeature> = Some(FantochFeature::Amortize);
+// processes and client config
+const CPUS: Option<usize> = None;
+
+// fantoch run config
+const BRANCH: &str = "master";
+const FEATURES: &[FantochFeature] = &[FantochFeature::Jemalloc];
+const RUN_MODE: RunMode = RunMode::Release;
+// const FEATURES: &[FantochFeature] = &[];
+// const RUN_MODE: RunMode = RunMode::Heaptrack;
+
+// list of protocol binaries to cleanup before running the experiment
+const PROTOCOLS_TO_CLEANUP: &[Protocol] = &[Protocol::NewtAtomic];
 
 macro_rules! config {
     ($n:expr, $f:expr, $tiny_quorums:expr, $clock_bump_interval:expr, $skip_fast_ack:expr) => {{
@@ -58,9 +74,6 @@ macro_rules! config {
 
 #[tokio::main]
 async fn main() -> Result<(), Report> {
-    // init logging
-    tracing_subscriber::fmt::init();
-
     let regions = vec![
         Region::EuWest1,
         Region::UsWest1,
@@ -142,7 +155,7 @@ async fn main() -> Result<(), Report> {
         // 1024 * 48,
         // 1024 * 56,
         1024 * 64,
-        1024 * 96,
+        // 1024 * 96,
         1024 * 128,
         1024 * 160,
         1024 * 192,
@@ -152,7 +165,7 @@ async fn main() -> Result<(), Report> {
         1024 * 272,
     ];
     let shards_per_command = 1;
-    let shard_count = 6;
+    let shard_count = 1;
     let keys_per_shard = 1;
     let zipf_coefficient = 1.0;
     let zipf_key_count = 1_000_000;
@@ -183,7 +196,12 @@ async fn main() -> Result<(), Report> {
     let planet = Some(Planet::from("../latency_aws"));
     // let planet = None; // if delay is not to be injected
 
-    baremetal_bench(
+    // init logging
+    let progress = TracingProgressBar::init(
+        (workloads.len() * clients_per_region.len() * configs.len()) as u64,
+    );
+
+    local_bench(
         regions,
         shard_count,
         planet,
@@ -191,9 +209,21 @@ async fn main() -> Result<(), Report> {
         clients_per_region,
         workloads,
         skip,
+        progress,
     )
     .await
     /*
+    local_bench(
+        regions,
+        shard_count,
+        planet,
+        configs,
+        clients_per_region,
+        workloads,
+        skip,
+        progress,
+    )
+    .await
     aws_bench(
         regions,
         shard_count,
@@ -201,8 +231,50 @@ async fn main() -> Result<(), Report> {
         clients_per_region,
         workloads,
         skip,
+        progress,
     ).await
     */
+}
+
+#[allow(dead_code)]
+async fn local_bench(
+    regions: Vec<Region>,
+    shard_count: usize,
+    planet: Option<Planet>,
+    configs: Vec<(Protocol, Config)>,
+    clients_per_region: Vec<usize>,
+    workloads: Vec<Workload>,
+    skip: impl Fn(Protocol, Config, usize) -> bool,
+    progress: TracingProgressBar,
+) -> Result<(), Report>
+where
+{
+    // setup baremetal machines
+    let machines = fantoch_exp::testbed::local::setup(
+        regions,
+        shard_count,
+        BRANCH.to_string(),
+        RUN_MODE,
+        FEATURES.to_vec(),
+    )
+    .await
+    .wrap_err("local spawn")?;
+
+    // run benchmarks
+    run_bench(
+        machines,
+        Testbed::Local,
+        planet,
+        configs,
+        clients_per_region,
+        workloads,
+        skip,
+        progress,
+    )
+    .await
+    .wrap_err("run bench")?;
+
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -214,6 +286,7 @@ async fn baremetal_bench(
     clients_per_region: Vec<usize>,
     workloads: Vec<Workload>,
     skip: impl Fn(Protocol, Config, usize) -> bool,
+    progress: TracingProgressBar,
 ) -> Result<(), Report>
 where
 {
@@ -223,9 +296,6 @@ where
         shard_count,
     );
 
-    // compute features
-    let features = FEATURE.map(|feature| vec![feature]).unwrap_or_default();
-
     // setup baremetal machines
     let machines = fantoch_exp::testbed::baremetal::setup(
         &mut launchers,
@@ -233,7 +303,7 @@ where
         shard_count,
         BRANCH.to_string(),
         RUN_MODE,
-        features.clone(),
+        FEATURES.to_vec(),
     )
     .await
     .wrap_err("baremetal spawn")?;
@@ -241,13 +311,13 @@ where
     // run benchmarks
     run_bench(
         machines,
-        features,
         Testbed::Baremetal,
         planet,
         configs,
         clients_per_region,
         workloads,
         skip,
+        progress,
     )
     .await
     .wrap_err("run bench")?;
@@ -263,6 +333,7 @@ async fn aws_bench(
     clients_per_region: Vec<usize>,
     workloads: Vec<Workload>,
     skip: impl Fn(Protocol, Config, usize) -> bool,
+    progress: TracingProgressBar,
 ) -> Result<(), Report> {
     let mut launcher: tsunami::providers::aws::Launcher<_> = Default::default();
     let res = do_aws_bench(
@@ -273,6 +344,7 @@ async fn aws_bench(
         clients_per_region,
         workloads,
         skip,
+        progress,
     )
     .await;
 
@@ -297,10 +369,8 @@ async fn do_aws_bench(
     clients_per_region: Vec<usize>,
     workloads: Vec<Workload>,
     skip: impl Fn(Protocol, Config, usize) -> bool,
+    progress: TracingProgressBar,
 ) -> Result<(), Report> {
-    // compute features
-    let features = FEATURE.map(|feature| vec![feature]).unwrap_or_default();
-
     // setup aws machines
     let machines = fantoch_exp::testbed::aws::setup(
         launcher,
@@ -312,7 +382,7 @@ async fn do_aws_bench(
         MAX_SPOT_INSTANCE_REQUEST_WAIT_SECS,
         BRANCH.to_string(),
         RUN_MODE,
-        features.clone(),
+        FEATURES.to_vec(),
     )
     .await
     .wrap_err("aws spawn")?;
@@ -323,13 +393,13 @@ async fn do_aws_bench(
     // run benchmarks
     run_bench(
         machines,
-        features,
         Testbed::Aws,
         planet,
         configs,
         clients_per_region,
         workloads,
         skip,
+        progress,
     )
     .await
     .wrap_err("run bench")?;
@@ -339,25 +409,29 @@ async fn do_aws_bench(
 
 async fn run_bench(
     machines: Machines<'_>,
-    features: Vec<FantochFeature>,
     testbed: Testbed,
     planet: Option<Planet>,
     configs: Vec<(Protocol, Config)>,
     clients_per_region: Vec<usize>,
     workloads: Vec<Workload>,
     skip: impl Fn(Protocol, Config, usize) -> bool,
+    progress: TracingProgressBar,
 ) -> Result<(), Report> {
     fantoch_exp::bench::bench_experiment(
         machines,
         RUN_MODE,
-        features,
+        FEATURES.to_vec(),
         testbed,
         planet,
         configs,
         TRACER_SHOW_INTERVAL,
         clients_per_region,
         workloads,
+        CPUS,
         skip,
+        EXPERIMENT_TIMEOUTS,
+        PROTOCOLS_TO_CLEANUP.to_vec(),
+        progress,
         RESULTS_DIR,
     )
     .await

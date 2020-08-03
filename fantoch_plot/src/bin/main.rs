@@ -10,7 +10,7 @@ use fantoch_plot::{
 use std::collections::HashMap;
 
 // folder where all results are stored
-const RESULTS_DIR: &str = "../partial_replication";
+const RESULTS_DIR: &str = "../save_allocs";
 // folder where all plots will be stored
 const PLOT_DIR: Option<&str> = Some("plots");
 
@@ -44,13 +44,13 @@ fn partial_replication() -> Result<(), Report> {
         (1, 1),
         (1, 2),
         (2, 2),
-        (1, 6),
         /*
         (1, 3),
         (2, 3),
         (1, 4),
         (1, 5),
         */
+        (1, 6),
     ];
 
     // load results
@@ -60,6 +60,7 @@ fn partial_replication() -> Result<(), Report> {
         1024 * 4,
         1024 * 8,
         1024 * 16,
+        1024 * 24,
         1024 * 32,
         1024 * 36,
         1024 * 40,

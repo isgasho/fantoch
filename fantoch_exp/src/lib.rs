@@ -3,7 +3,9 @@
 #[cfg(feature = "exp")]
 pub mod bench;
 #[cfg(feature = "exp")]
-pub mod exp;
+pub mod machine;
+#[cfg(feature = "exp")]
+pub mod progress;
 #[cfg(feature = "exp")]
 pub mod testbed;
 #[cfg(feature = "exp")]
@@ -11,8 +13,8 @@ pub mod util;
 
 pub mod config;
 
-// Re-export `ExperimentConfig`.
-pub use config::ExperimentConfig;
+// Re-exports.
+pub use config::{ExperimentConfig, ProcessType};
 
 use color_eyre::eyre::WrapErr;
 use color_eyre::Report;
@@ -27,6 +29,7 @@ pub enum RunMode {
     Heaptrack,
 }
 
+#[cfg(feature = "exp")]
 impl RunMode {
     pub fn name(&self) -> String {
         match self {
@@ -37,21 +40,36 @@ impl RunMode {
         .to_string()
     }
 
-    pub fn binary(&self, binary: &str) -> String {
-        let binary = format!("./fantoch/target/release/{}", binary);
+    pub fn run_command(
+        &self,
+        process_type: ProcessType,
+        binary: &str,
+    ) -> String {
+        let run_command = format!("./fantoch/target/release/{}", binary);
         match self {
-            Self::Release => binary,
+            Self::Release => run_command,
             Self::Flamegraph => {
+                // compute flamegraph file
+                let flamegraph_file = config::run_file(
+                    process_type,
+                    crate::bench::FLAMEGRAPH_FILE_EXT,
+                );
+                // compute perf file (which will be supported once https://github.com/flamegraph-rs/flamegraph/pull/95 gets in)
+                let perf_file = config::run_file(process_type, "perf.data");
                 // `source` is needed in order for `flamegraph` to be found
-                format!("source ~/.cargo/env && flamegraph {}", binary)
+                format!(
+                    "source ~/.cargo/env && flamegraph -o {} -c 'record -F 997 --call-graph dwarf -g -o {}' {}",
+                    flamegraph_file, perf_file, run_command
+                )
             }
-            Self::Heaptrack => format!("heaptrack {}", binary),
+            Self::Heaptrack => format!("heaptrack {}", run_command),
         }
     }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum FantochFeature {
+    Jemalloc,
     Amortize,
     Prof,
 }
@@ -59,6 +77,7 @@ pub enum FantochFeature {
 impl FantochFeature {
     pub fn name(&self) -> String {
         match self {
+            FantochFeature::Jemalloc => "jemalloc",
             FantochFeature::Amortize => "amortize",
             FantochFeature::Prof => "prof",
         }
@@ -89,7 +108,7 @@ pub enum Protocol {
 }
 
 impl Protocol {
-    pub fn binary(&self) -> &str {
+    pub fn binary(&self) -> &'static str {
         match self {
             Protocol::AtlasLocked => "atlas_locked",
             Protocol::EPaxosLocked => "epaxos_locked",
@@ -106,11 +125,17 @@ impl Protocol {
 pub enum Testbed {
     Aws,
     Baremetal,
+    Local,
 }
 
 impl Testbed {
-    pub fn is_aws(&self) -> bool {
-        self == &Testbed::Aws
+    pub fn name(&self) -> String {
+        match self {
+            Self::Aws => "aws",
+            Self::Baremetal => "baremetal",
+            Self::Local => "local",
+        }
+        .to_string()
     }
 }
 

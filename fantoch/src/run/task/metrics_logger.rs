@@ -64,7 +64,10 @@ pub async fn metrics_logger_task(
                 if let Err(e) = crate::run::serialize_and_compress(&global_metrics, &tmp) {
                     panic!("[metrics_logger] couldn't serialize metrics: {:?}", e);
                 }
-                std::fs::rename(&tmp, &metrics_file).expect("couldn't rename temporary metrics file");
+                // rename file
+                if let Err(e) = std::fs::rename(&tmp, &metrics_file) {
+                    println!("[metrics_logger] coudn't rename temporary metrics file: {:?}", e);
+                }
             }
         }
     }

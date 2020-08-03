@@ -2,6 +2,7 @@ use clap::{App, Arg};
 use fantoch::config::Config;
 use fantoch::id::{ProcessId, ShardId};
 use fantoch::protocol::Protocol;
+#[cfg(any(feature = "jemalloc", feature = "prof"))]
 use jemallocator::Jemalloc;
 use std::error::Error;
 use std::net::IpAddr;
@@ -31,7 +32,7 @@ const DEFAULT_NEWT_DETACHED_SEND_INTERVAL: Duration = Duration::from_millis(5);
 const DEFAULT_SKIP_FAST_ACK: bool = false;
 
 #[global_allocator]
-#[cfg(not(feature = "prof"))]
+#[cfg(all(feature = "jemalloc", not(feature = "prof")))]
 static ALLOC: Jemalloc = Jemalloc;
 #[cfg(feature = "prof")]
 static ALLOC: fantoch_prof::AllocProf<Jemalloc> =
@@ -58,6 +59,7 @@ type ProtocolArgs = (
     Option<usize>,
     Option<usize>,
     Option<String>,
+    Option<usize>,
 );
 
 #[allow(dead_code)]
@@ -86,6 +88,7 @@ where
         tracer_show_interval,
         ping_interval,
         metrics_file,
+        cpus,
     ) = parse_args();
 
     let process = fantoch::run::process::<P, String>(
@@ -110,7 +113,7 @@ where
         ping_interval,
         metrics_file,
     );
-    super::tokio_runtime().block_on(process)
+    super::tokio_runtime(cpus).block_on(process)
 }
 
 fn parse_args() -> ProtocolArgs {
@@ -338,6 +341,13 @@ fn parse_args() -> ProtocolArgs {
                 .help("file in which metrics are (periodically, every 5s) written to; by default metrics are not logged")
                 .takes_value(true),
         )
+        .arg(
+            Arg::with_name("cpus")
+                .long("cpus")
+                .value_name("CPUS")
+                .help("number of cpus to be used by tokio; by default all available cpus are used")
+                .takes_value(true),
+        )
         .get_matches();
 
     // parse arguments
@@ -389,6 +399,7 @@ fn parse_args() -> ProtocolArgs {
         parse_tracer_show_interval(matches.value_of("tracer_show_interval"));
     let ping_interval = parse_ping_interval(matches.value_of("ping_interval"));
     let metrics_file = parse_metrics_file(matches.value_of("metrics_file"));
+    let cpus = super::parse_cpus(matches.value_of("cpus"));
 
     println!("process id: {}", process_id);
     println!("sorted processes: {:?}", sorted_processes);
@@ -437,6 +448,7 @@ fn parse_args() -> ProtocolArgs {
         tracer_show_interval,
         ping_interval,
         metrics_file,
+        cpus,
     )
 }
 
