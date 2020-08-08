@@ -18,7 +18,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Debug};
 
-pub trait Executor: Clone {
+pub trait Executor: Sized {
     // TODO why is Send needed?
     type ExecutionInfo: Debug
         + Clone
@@ -42,12 +42,34 @@ pub trait Executor: Clone {
     // Parallel executors may receive several waits for the same `Rifl`.
     fn wait_for_rifl(&mut self, rifl: Rifl);
 
+    fn handle(&mut self, infos: Self::ExecutionInfo);
+
     #[must_use]
-    fn handle(&mut self, infos: Self::ExecutionInfo) -> Vec<ExecutorResult>;
+    fn to_clients(&mut self) -> Option<ExecutorResult>;
+
+    #[must_use]
+    fn to_clients_iter(&mut self) -> ToClientsIter<'_, Self> {
+        ToClientsIter { executor: self }
+    }
 
     fn parallel() -> bool;
 
     fn metrics(&self) -> &ExecutorMetrics;
+}
+
+pub struct ToClientsIter<'a, E> {
+    executor: &'a mut E,
+}
+
+impl<'a, E> Iterator for ToClientsIter<'a, E>
+where
+    E: Executor,
+{
+    type Item = ExecutorResult;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.executor.to_clients()
+    }
 }
 
 pub type ExecutorMetrics = Metrics<ExecutorMetricsKind, u64>;
@@ -76,7 +98,7 @@ pub trait MessageKey {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ExecutorResult {
     /// this contains a complete command result
     Ready(CommandResult),

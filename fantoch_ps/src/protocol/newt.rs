@@ -4,6 +4,7 @@ use crate::protocol::common::table::{
     AtomicKeyClocks, FineLockedKeyClocks, KeyClocks, LockedKeyClocks,
     QuorumClocks, SequentialKeyClocks, Votes,
 };
+use crate::protocol::partial::{self, ShardsCommits};
 use fantoch::command::Command;
 use fantoch::config::Config;
 use fantoch::executor::Executor;
@@ -30,11 +31,12 @@ pub type NewtFineLocked = Newt<FineLockedKeyClocks>;
 type ExecutionInfo = <TableExecutor as Executor>::ExecutionInfo;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Newt<KC> {
+pub struct Newt<KC: KeyClocks> {
     bp: BaseProcess,
     key_clocks: KC,
     cmds: CommandsInfo<NewtInfo>,
-    to_executor: Vec<ExecutionInfo>,
+    to_processes: Vec<Action<Self>>,
+    to_executors: Vec<ExecutionInfo>,
     // set of detached votes
     detached: Votes,
     // commit notifications that arrived before the initial `MCollect` message
@@ -42,6 +44,12 @@ pub struct Newt<KC> {
     buffered_commits: HashMap<Dot, (ProcessId, u64, Votes)>,
     // bump to messages that arrived before the initial `MCollect` message
     buffered_bump_tos: HashMap<Dot, u64>,
+    // With many many operations, it can happen that logical clocks are
+    // higher that current time (e.g. if it starts at 0 in simulation), and in
+    // that case, the real time feature of newt doesn't work. Solution: track
+    // the highest committed clock; when periodically bumping with real time,
+    // use this value as the minimum value to bump to
+    max_commit_clock: u64,
     skip_fast_ack: bool,
 }
 
@@ -76,10 +84,12 @@ impl<KC: KeyClocks> Protocol for Newt<KC> {
             config.f(),
             fast_quorum_size,
         );
-        let to_executor = Vec::new();
+        let to_processes = Vec::new();
+        let to_executors = Vec::new();
         let detached = Votes::new();
         let buffered_commits = HashMap::new();
         let buffered_bump_tos = HashMap::new();
+        let max_commit_clock = 0;
         // enable skip fast ack if configured like that and the fast quorum size
         // is 2
         let skip_fast_ack = config.skip_fast_ack() && fast_quorum_size == 2;
@@ -89,10 +99,12 @@ impl<KC: KeyClocks> Protocol for Newt<KC> {
             bp,
             key_clocks,
             cmds,
-            to_executor,
+            to_processes,
+            to_executors,
             detached,
             buffered_commits,
             buffered_bump_tos,
+            max_commit_clock,
             skip_fast_ack,
         };
 
@@ -136,13 +148,8 @@ impl<KC: KeyClocks> Protocol for Newt<KC> {
     }
 
     /// Submits a command issued by some client.
-    fn submit(
-        &mut self,
-        dot: Option<Dot>,
-        cmd: Command,
-        _time: &dyn SysTime,
-    ) -> Vec<Action<Self>> {
-        self.handle_submit(dot, cmd, true)
+    fn submit(&mut self, dot: Option<Dot>, cmd: Command, _time: &dyn SysTime) {
+        self.handle_submit(dot, cmd, true);
     }
 
     /// Handles protocol messages.
@@ -152,7 +159,7 @@ impl<KC: KeyClocks> Protocol for Newt<KC> {
         from_shard_id: ShardId,
         msg: Self::Message,
         time: &dyn SysTime,
-    ) -> Vec<Action<Self>> {
+    ) {
         match msg {
             // Protocol messages
             Message::MCollect {
@@ -177,6 +184,9 @@ impl<KC: KeyClocks> Protocol for Newt<KC> {
             } => self.handle_mcollectack(from, dot, clock, process_votes, time),
             Message::MCommit { dot, clock, votes } => {
                 self.handle_mcommit(from, dot, clock, votes, time)
+            }
+            Message::MCommitClock { clock } => {
+                self.handle_mcommit_clock(from, clock, time)
             }
             Message::MDetached { detached } => {
                 self.handle_mdetached(detached, time)
@@ -214,11 +224,7 @@ impl<KC: KeyClocks> Protocol for Newt<KC> {
     }
 
     /// Handles periodic local events.
-    fn handle_event(
-        &mut self,
-        event: Self::PeriodicEvent,
-        time: &dyn SysTime,
-    ) -> Vec<Action<Self>> {
+    fn handle_event(&mut self, event: Self::PeriodicEvent, time: &dyn SysTime) {
         match event {
             PeriodicEvent::GarbageCollection => {
                 self.handle_event_garbage_collection(time)
@@ -230,9 +236,14 @@ impl<KC: KeyClocks> Protocol for Newt<KC> {
         }
     }
 
-    /// Returns new commands results to be sent to clients.
-    fn to_executor(&mut self) -> Vec<ExecutionInfo> {
-        mem::take(&mut self.to_executor)
+    /// Returns a new action to be sent to other processes.
+    fn to_processes(&mut self) -> Option<Action<Self>> {
+        self.to_processes.pop()
+    }
+
+    /// Returns new execution info for executors.
+    fn to_executors(&mut self) -> Option<ExecutionInfo> {
+        self.to_executors.pop()
     }
 
     fn parallel() -> bool {
@@ -256,17 +267,20 @@ impl<KC: KeyClocks> Newt<KC> {
         dot: Option<Dot>,
         cmd: Command,
         target_shard: bool,
-    ) -> Vec<Action<Self>> {
+    ) {
         // compute the command identifier
         let dot = dot.unwrap_or_else(|| self.bp.next_dot());
 
         // create submit actions
-        let mut actions = self.submit_actions(dot, &cmd, target_shard);
-        log!(
-            "p{}: submit extra actions for {:?}: {:?}",
-            self.id(),
+        let create_mforward_submit =
+            |dot, cmd| Message::MForwardSubmit { dot, cmd };
+        partial::submit_actions(
+            &self.bp,
             dot,
-            actions
+            &cmd,
+            target_shard,
+            create_mforward_submit,
+            &mut self.to_processes,
         );
 
         // compute its clock:
@@ -309,12 +323,11 @@ impl<KC: KeyClocks> Newt<KC> {
         };
         let target = self.bp.all();
 
-        // add `MCollect` send as action and return all actions
-        actions.push(Action::ToSend {
+        // add `MCollect` send as action
+        self.to_processes.push(Action::ToSend {
             target,
             msg: mcollect,
         });
-        actions
     }
 
     #[instrument(skip(
@@ -336,7 +349,7 @@ impl<KC: KeyClocks> Newt<KC> {
         remote_clock: u64,
         mut votes: Votes,
         time: &dyn SysTime,
-    ) -> Vec<Action<Self>> {
+    ) {
         log!(
             "p{}: MCollect({:?}, {:?}, {:?}, {}, {:?}) from {} | time={}",
             self.id(),
@@ -346,7 +359,7 @@ impl<KC: KeyClocks> Newt<KC> {
             remote_clock,
             votes,
             from,
-            time.millis()
+            time.micros()
         );
 
         // get cmd info
@@ -354,14 +367,14 @@ impl<KC: KeyClocks> Newt<KC> {
 
         // discard message if no longer in START
         if info.status != Status::START {
-            return vec![];
+            return;
         }
 
         // check if part of fast quorum
         if !quorum.contains(&self.bp.process_id) {
             // if not:
             // - maybe initialize `self.key_clocks`
-            // - simply save the payload and set status to `PENDING`
+            // - simply save the payload and set status to `PAYLOAD`
             // - if we received the `MCommit` before the `MCollect`, handle the
             //   `MCommit` now
 
@@ -372,7 +385,7 @@ impl<KC: KeyClocks> Newt<KC> {
                 self.key_clocks.init_clocks(&cmd);
             }
 
-            info.status = Status::PENDING;
+            info.status = Status::PAYLOAD;
             info.cmd = Some(cmd);
 
             // check if there's a buffered commit notification; if yes, handle
@@ -380,10 +393,9 @@ impl<KC: KeyClocks> Newt<KC> {
             if let Some((from, clock, votes)) =
                 self.buffered_commits.remove(&dot)
             {
-                return self.handle_mcommit(from, dot, clock, votes, time);
-            } else {
-                return vec![];
+                self.handle_mcommit(from, dot, clock, votes, time);
             }
+            return;
         }
 
         // check if it's a message from self
@@ -433,7 +445,15 @@ impl<KC: KeyClocks> Newt<KC> {
 
             // if tiny quorums and f = 1, the fast quorum process can commit the
             // command right away; create `MCommit`
-            self.mcommit_actions(dot, clock, votes, shard_count)
+            Self::mcommit_actions(
+                &self.bp,
+                info,
+                shard_count,
+                dot,
+                clock,
+                votes,
+                &mut self.to_processes,
+            )
         } else {
             self.mcollect_actions(from, dot, clock, process_votes, shard_count)
         }
@@ -447,7 +467,7 @@ impl<KC: KeyClocks> Newt<KC> {
         clock: u64,
         remote_votes: Votes,
         _time: &dyn SysTime,
-    ) -> Vec<Action<Self>> {
+    ) {
         log!(
             "p{}: MCollectAck({:?}, {}, {:?}) from {} | time={}",
             self.id(),
@@ -455,7 +475,7 @@ impl<KC: KeyClocks> Newt<KC> {
             clock,
             remote_votes,
             from,
-            _time.millis()
+            _time.micros()
         );
 
         // get cmd info
@@ -463,7 +483,7 @@ impl<KC: KeyClocks> Newt<KC> {
 
         if info.status != Status::COLLECT {
             // do nothing if we're no longer COLLECT
-            return vec![];
+            return;
         }
 
         // update votes with remote votes
@@ -487,8 +507,9 @@ impl<KC: KeyClocks> Newt<KC> {
         //   is no longer a problem
         //
         // - TODO: it also seems that this (or the MCommit equivalent) must run
-        //   with real time, otherwise there's a huge tail; but that don't make
-        //   any sense
+        //   with real time, otherwise there's a huge tail; but that doesn't
+        //   make any sense; NOTE: this was probably before high-resolution
+        //   real-time clocks
         let cmd = info.cmd.as_ref().unwrap();
         if !message_from_self {
             self.key_clocks.vote(cmd, max_clock, &mut self.detached);
@@ -506,7 +527,15 @@ impl<KC: KeyClocks> Newt<KC> {
 
                 // create `MCommit`
                 let shard_count = cmd.shard_count();
-                self.mcommit_actions(dot, max_clock, votes, shard_count)
+                Self::mcommit_actions(
+                    &self.bp,
+                    info,
+                    shard_count,
+                    dot,
+                    max_clock,
+                    votes,
+                    &mut self.to_processes,
+                )
             } else {
                 self.bp.slow_path();
                 // slow path: create `MConsensus`
@@ -517,14 +546,12 @@ impl<KC: KeyClocks> Newt<KC> {
                     clock: max_clock,
                 };
                 let target = self.bp.write_quorum();
-                // return `ToSend`
-                vec![Action::ToSend {
+                // save new action
+                self.to_processes.push(Action::ToSend {
                     target,
                     msg: mconsensus,
-                }]
+                })
             }
-        } else {
-            vec![]
         }
     }
 
@@ -536,14 +563,14 @@ impl<KC: KeyClocks> Newt<KC> {
         clock: u64,
         mut votes: Votes,
         _time: &dyn SysTime,
-    ) -> Vec<Action<Self>> {
+    ) {
         log!(
             "p{}: MCommit({:?}, {}, {:?}) | time={}",
             self.id(),
             dot,
             clock,
             votes,
-            _time.millis()
+            _time.micros()
         );
 
         // get cmd info
@@ -556,24 +583,16 @@ impl<KC: KeyClocks> Newt<KC> {
             //   `MCollect` and `MCommit` in opposite orders (due to
             //   multiplexing)
             self.buffered_commits.insert(dot, (from, clock, votes));
-            return vec![];
+            return;
         }
 
         if info.status == Status::COMMIT {
             // do nothing if we're already COMMIT
-            return vec![];
+            return;
         }
 
-        // update command info:
-        info.status = Status::COMMIT;
-
-        // handle commit in synod
-        let msg = SynodMessage::MChosen(clock);
-        assert!(info.synod.handle(from, msg).is_none());
-
-        // create execution info if not a noop
-        let cmd = info.cmd.clone().expect("there should be a command payload");
         // create execution info
+        let cmd = info.cmd.clone().expect("there should be a command payload");
         let rifl = cmd.rifl();
         let execution_info =
             cmd.into_iter(self.bp.shard_id).map(|(key, op)| {
@@ -583,11 +602,25 @@ impl<KC: KeyClocks> Newt<KC> {
                     .expect("there should be votes on all command keys");
                 ExecutionInfo::votes(dot, clock, rifl, key, op, key_votes)
             });
-        self.to_executor.extend(execution_info);
+        self.to_executors.extend(execution_info);
+
+        // update command info:
+        info.status = Status::COMMIT;
+
+        // handle commit in synod
+        let msg = SynodMessage::MChosen(clock);
+        assert!(info.synod.handle(from, msg).is_none());
 
         // don't try to generate detached votes if configured with real time
         // (since it will be done in a periodic event)
-        if self.bp.config.newt_clock_bump_interval().is_none() {
+        if self.bp.config.newt_clock_bump_interval().is_some() {
+            // in this case, only notify the clock bump worker of the commit
+            // clock
+            self.to_processes.push(Action::ToForward {
+                msg: Message::MCommitClock { clock },
+            });
+        } else {
+            // try to generate detached votes
             let cmd = info.cmd.as_ref().unwrap();
             self.key_clocks.vote(cmd, clock, &mut self.detached);
         }
@@ -600,29 +633,42 @@ impl<KC: KeyClocks> Newt<KC> {
         if self.gc_running() && my_shard {
             // if running gc and this dot belongs to my shard, then notify self
             // (i.e. the worker responsible for GC) with the committed dot
-            vec![Action::ToForward {
+            self.to_processes.push(Action::ToForward {
                 msg: Message::MCommitDot { dot },
-            }]
+            });
         } else {
             // not running gc, so remove the dot info now
             self.cmds.gc_single(dot);
-            vec![]
         }
     }
 
-    #[instrument(skip(self, dot, clock, _time))]
-    fn handle_mbump_to(
+    #[instrument(skip(self, from, clock, _time))]
+    fn handle_mcommit_clock(
         &mut self,
-        dot: Dot,
+        from: ProcessId,
         clock: u64,
         _time: &dyn SysTime,
-    ) -> Vec<Action<Self>> {
+    ) {
+        log!(
+            "p{}: MCommitClock({}) | time={}",
+            self.id(),
+            clock,
+            _time.micros()
+        );
+        assert_eq!(from, self.bp.process_id);
+
+        // simply update the highest commit clock
+        self.max_commit_clock = std::cmp::max(self.max_commit_clock, clock);
+    }
+
+    #[instrument(skip(self, dot, clock, _time))]
+    fn handle_mbump_to(&mut self, dot: Dot, clock: u64, _time: &dyn SysTime) {
         log!(
             "p{}: MBumpTo({:?}, {}) | time={}",
             self.id(),
             dot,
             clock,
-            _time.millis()
+            _time.micros()
         );
 
         // get cmd info
@@ -643,30 +689,22 @@ impl<KC: KeyClocks> Newt<KC> {
             // highest one
             *current = std::cmp::max(*current, clock);
         }
-        vec![]
     }
 
     #[instrument(skip(self, detached, _time))]
-    fn handle_mdetached(
-        &mut self,
-        detached: Votes,
-        _time: &dyn SysTime,
-    ) -> Vec<Action<Self>> {
+    fn handle_mdetached(&mut self, detached: Votes, _time: &dyn SysTime) {
         log!(
             "p{}: MDetached({:?}) | time={}",
             self.id(),
             detached,
-            _time.millis()
+            _time.micros()
         );
 
         // create execution info
         let execution_info = detached.into_iter().map(|(key, key_votes)| {
             ExecutionInfo::detached_votes(key, key_votes)
         });
-        self.to_executor.extend(execution_info);
-
-        // nothing to send
-        vec![]
+        self.to_executors.extend(execution_info);
     }
 
     #[instrument(skip(self, from, dot, ballot, clock, _time))]
@@ -677,14 +715,14 @@ impl<KC: KeyClocks> Newt<KC> {
         ballot: u64,
         clock: ConsensusValue,
         _time: &dyn SysTime,
-    ) -> Vec<Action<Self>> {
+    ) {
         log!(
             "p{}: MConsensus({:?}, {}, {:?}) | time={}",
             self.id(),
             dot,
             ballot,
             clock,
-            _time.millis()
+            _time.micros()
         );
 
         // get cmd info
@@ -706,8 +744,8 @@ impl<KC: KeyClocks> Newt<KC> {
                 Message::MCommit { dot, clock, votes }
             }
             None => {
-                // ballot too low to be accepted
-                return vec![];
+                // ballot too low to be accepted: nothing to do
+                return;
             }
             _ => panic!(
                 "no other type of message should be output by Synod in the MConsensus handler"
@@ -717,8 +755,8 @@ impl<KC: KeyClocks> Newt<KC> {
         // create target
         let target = singleton![from];
 
-        // return `ToSend`
-        vec![Action::ToSend { target, msg }]
+        // save new action
+        self.to_processes.push(Action::ToSend { target, msg });
     }
 
     #[instrument(skip(self, from, dot, ballot, _time))]
@@ -728,13 +766,13 @@ impl<KC: KeyClocks> Newt<KC> {
         dot: Dot,
         ballot: u64,
         _time: &dyn SysTime,
-    ) -> Vec<Action<Self>> {
+    ) {
         log!(
             "p{}: MConsensusAck({:?}, {}) | time={}",
             self.id(),
             dot,
             ballot,
-            _time.millis()
+            _time.micros()
         );
 
         // get cmd info
@@ -750,11 +788,10 @@ impl<KC: KeyClocks> Newt<KC> {
 
                 // enough accepts were gathered and the value has been chosen; create `MCommit`
                 let shard_count = info.cmd.as_ref().unwrap().shard_count();
-                self.mcommit_actions(dot, clock, votes, shard_count)
+                Self::mcommit_actions(&self.bp, info, shard_count, dot, clock, votes, &mut self.to_processes)
             }
             None => {
-                // not enough accepts yet
-                vec![]
+                // not enough accepts yet: nothing to do
             }
             _ => panic!(
                 "no other type of message should be output by Synod in the MConsensusAck handler"
@@ -770,51 +807,43 @@ impl<KC: KeyClocks> Newt<KC> {
         dot: Dot,
         clock: u64,
         _time: &dyn SysTime,
-    ) -> Vec<Action<Self>> {
+    ) {
         log!(
             "p{}: MShardCommit({:?}, {}) from shard {} | time={}",
             self.id(),
             dot,
             clock,
             _from_shard_id,
-            _time.millis()
+            _time.micros()
         );
 
         // get cmd info
         let info = self.cmds.get(dot);
 
-        // make sure shards commit info is initialized:
-        // - it may not be if we receive the `MCommitShard` from another shard
-        //   before we were able to commit the command in our own shard
-        let shards_commits =
-            if let Some(shards_commits) = info.shards_commits.as_mut() {
-                shards_commits
-            } else {
-                let process_id = self.bp.process_id;
-                let shard_count = info.cmd.as_ref().unwrap().shard_count();
-                info.shards_commits =
-                    Some(ShardsCommits::new(process_id, shard_count));
-                info.shards_commits.as_mut().unwrap()
+        let shard_count = info.cmd.as_ref().unwrap().shard_count();
+        let add_shards_commits_info =
+            |shards_commit_info: &mut ShardsCommitsInfo, clock| {
+                shards_commit_info.add(clock)
+            };
+        let create_mshard_aggregated_commit =
+            |dot, shards_commit_info: &ShardsCommitsInfo| {
+                Message::MShardAggregatedCommit {
+                    dot,
+                    clock: shards_commit_info.max_clock,
+                }
             };
 
-        // add new clock, checking if we have received all clocks
-        let done = shards_commits.add(from, clock);
-        if done {
-            // create `MShardAggregatedCommit`
-            let mshard_aggregated_commit = Message::MShardAggregatedCommit {
-                dot,
-                clock: shards_commits.max_clock,
-            };
-            let target = shards_commits.participants.clone();
-
-            // return `ToSend`
-            vec![Action::ToSend {
-                target,
-                msg: mshard_aggregated_commit,
-            }]
-        } else {
-            Vec::new()
-        }
+        partial::handle_mshard_commit(
+            &self.bp,
+            &mut info.shards_commits,
+            shard_count,
+            from,
+            dot,
+            clock,
+            add_shards_commits_info,
+            create_mshard_aggregated_commit,
+            &mut self.to_processes,
+        )
     }
 
     #[instrument(skip(self, dot, clock, _time))]
@@ -823,34 +852,36 @@ impl<KC: KeyClocks> Newt<KC> {
         dot: Dot,
         clock: u64,
         _time: &dyn SysTime,
-    ) -> Vec<Action<Self>> {
+    ) {
         log!(
             "p{}: MShardAggregatedCommit({:?}, {}) | time={}",
             self.id(),
             dot,
             clock,
-            _time.millis()
+            _time.micros()
         );
 
         // get cmd info
         let info = self.cmds.get(dot);
 
-        // take shards commit info
-        let shards_commits = if let Some(shards_commits) =
-            info.shards_commits.take()
-        {
-            shards_commits
-        } else {
-            panic!("no shards commit info when handling MShardAggregatedCommit about dot {:?}", dot)
-        };
+        let extract_mcommit_extra_data =
+            |shards_commit_info: ShardsCommitsInfo| {
+                shards_commit_info
+                    .votes
+                    .expect("votes in shard commit info should be set")
+            };
+        let create_mcommit =
+            |dot, clock, votes| Message::MCommit { dot, clock, votes };
 
-        // get votes
-        let votes = shards_commits
-            .votes
-            .expect("votes in shard commit info should be set");
-
-        // create `MCommit`
-        self.final_mcommit_action(dot, clock, votes)
+        partial::handle_mshard_aggregated_commit(
+            &self.bp,
+            &mut info.shards_commits,
+            dot,
+            clock,
+            extract_mcommit_extra_data,
+            create_mcommit,
+            &mut self.to_processes,
+        )
     }
 
     #[instrument(skip(self, from, dot, _time))]
@@ -859,16 +890,15 @@ impl<KC: KeyClocks> Newt<KC> {
         from: ProcessId,
         dot: Dot,
         _time: &dyn SysTime,
-    ) -> Vec<Action<Self>> {
+    ) {
         log!(
             "p{}: MCommitDot({:?}) | time={}",
             self.id(),
             dot,
-            _time.millis()
+            _time.micros()
         );
         assert_eq!(from, self.bp.process_id);
         self.cmds.commit(dot);
-        vec![]
     }
 
     #[instrument(skip(self, from, committed, _time))]
@@ -877,24 +907,22 @@ impl<KC: KeyClocks> Newt<KC> {
         from: ProcessId,
         committed: VClock<ProcessId>,
         _time: &dyn SysTime,
-    ) -> Vec<Action<Self>> {
+    ) {
         log!(
             "p{}: MGarbageCollection({:?}) from {} | time={}",
             self.id(),
             committed,
             from,
-            _time.millis()
+            _time.micros()
         );
         self.cmds.committed_by(from, committed);
         // compute newly stable dots
         let stable = self.cmds.stable();
         // create `ToForward` to self
-        if stable.is_empty() {
-            vec![]
-        } else {
-            vec![Action::ToForward {
+        if !stable.is_empty() {
+            self.to_processes.push(Action::ToForward {
                 msg: Message::MStable { stable },
-            }]
+            });
         }
     }
 
@@ -904,120 +932,74 @@ impl<KC: KeyClocks> Newt<KC> {
         from: ProcessId,
         stable: Vec<(ProcessId, u64, u64)>,
         _time: &dyn SysTime,
-    ) -> Vec<Action<Self>> {
+    ) {
         log!(
             "p{}: MStable({:?}) from {} | time={}",
             self.id(),
             stable,
             from,
-            _time.millis()
+            _time.micros()
         );
         assert_eq!(from, self.bp.process_id);
         let stable_count = self.cmds.gc(stable);
         self.bp.stable(stable_count);
-        vec![]
     }
 
     #[instrument(skip(self, _time))]
-    fn handle_event_garbage_collection(
-        &mut self,
-        _time: &dyn SysTime,
-    ) -> Vec<Action<Self>> {
+    fn handle_event_garbage_collection(&mut self, _time: &dyn SysTime) {
         log!(
             "p{}: PeriodicEvent::GarbageCollection | time={}",
             self.id(),
-            _time.millis()
+            _time.micros()
         );
 
         // retrieve the committed clock
         let committed = self.cmds.committed();
 
-        // create `ToSend`
-        vec![Action::ToSend {
+        // save new action
+        self.to_processes.push(Action::ToSend {
             target: self.bp.all_but_me(),
             msg: Message::MGarbageCollection { committed },
-        }]
+        });
     }
 
     #[instrument(skip(self, time))]
-    fn handle_event_clock_bump(
-        &mut self,
-        time: &dyn SysTime,
-    ) -> Vec<Action<Self>> {
+    fn handle_event_clock_bump(&mut self, time: &dyn SysTime) {
         log!(
             "p{}: PeriodicEvent::ClockBump | time={}",
             self.id(),
-            time.millis()
+            time.micros()
         );
 
-        // Iterate all clocks and bump them to the current time. The fact that
-        // micros as used here is not an accident. With many
+        // vote up to:
+        // - highest committed clock or
+        // - the current time,
+        // whatever is the highest.
+        // The fact that micros as used here is not an accident. With many
         // clients (like 1024 per site with 5 sites), millis do not provide
         // "enough precision".
+        let min_clock = std::cmp::max(self.max_commit_clock, time.micros());
+
+        // Iterate all clocks and bump them.
         // - TODO: only bump the clocks of active keys (i.e. keys with an
         //   `MCollect` without the  corresponding `MCommit`)
-        self.key_clocks.vote_all(time.micros(), &mut self.detached);
-        vec![]
+        self.key_clocks.vote_all(min_clock, &mut self.detached);
     }
 
     #[instrument(skip(self, _time))]
-    fn handle_event_send_detached(
-        &mut self,
-        _time: &dyn SysTime,
-    ) -> Vec<Action<Self>> {
+    fn handle_event_send_detached(&mut self, _time: &dyn SysTime) {
         log!(
             "p{}: PeriodicEvent::SendDetached | time={}",
             self.id(),
-            _time.millis()
+            _time.micros()
         );
 
         let detached = mem::take(&mut self.detached);
-        if detached.is_empty() {
-            vec![]
-        } else {
-            vec![Action::ToSend {
+        if !detached.is_empty() {
+            self.to_processes.push(Action::ToSend {
                 target: self.bp.all(),
                 msg: Message::MDetached { detached },
-            }]
-        }
-    }
-
-    fn submit_actions(
-        &self,
-        dot: Dot,
-        cmd: &Command,
-        target_shard: bool,
-    ) -> Vec<Action<Self>> {
-        if target_shard {
-            // action_count = (shard_count - 1)MForwardSubmit + 1MCollect =
-            // shard_count
-            let action_count = cmd.shard_count();
-            let mut actions = Vec::with_capacity(action_count);
-
-            // create forward submit messages if:
-            // - we're the target shard (i.e. the shard to which the client sent
-            //   the command)
-            // - command touches more than one shard
-            let my_shard_id = self.bp.shard_id;
-            for shard_id in
-                cmd.shards().filter(|shard_id| **shard_id != my_shard_id)
-            {
-                let mforward_submit = Message::MForwardSubmit {
-                    dot,
-                    cmd: cmd.clone(),
-                };
-                let target =
-                    singleton![self.bp.closest_shard_process(shard_id)];
-                actions.push(Action::ToSend {
-                    target,
-                    msg: mforward_submit,
-                })
-            }
-            actions
-        } else {
-            // action_count = 1MCollect
-            let action_count = 1;
-            Vec::with_capacity(action_count)
+            });
         }
     }
 
@@ -1031,11 +1013,7 @@ impl<KC: KeyClocks> Newt<KC> {
         clock: u64,
         process_votes: Votes,
         shard_count: usize,
-    ) -> Vec<Action<Self>> {
-        // action_count = (shard_count - 1)MBumpTo + 1MCollectAck =
-        // shard_count
-        let mut actions = Vec::with_capacity(shard_count);
-
+    ) {
         // create `MCollectAck`
         let mcollectack = Message::MCollectAck {
             dot,
@@ -1043,7 +1021,7 @@ impl<KC: KeyClocks> Newt<KC> {
             process_votes,
         };
         let target = singleton![from];
-        actions.push(Action::ToSend {
+        self.to_processes.push(Action::ToSend {
             msg: mcollectack,
             target,
         });
@@ -1061,84 +1039,44 @@ impl<KC: KeyClocks> Newt<KC> {
                 let mbump_to = Message::MBumpTo { dot, clock };
                 let target =
                     singleton![self.bp.closest_shard_process(shard_id)];
-                actions.push(Action::ToSend {
+                self.to_processes.push(Action::ToSend {
                     target,
                     msg: mbump_to,
                 })
             }
         }
-        actions
     }
 
     fn mcommit_actions(
-        &mut self,
-        dot: Dot,
-        clock: u64,
-        votes: Votes,
+        bp: &BaseProcess,
+        info: &mut NewtInfo,
         shard_count: usize,
-    ) -> Vec<Action<Self>> {
-        match shard_count {
-            1 => {
-                // create `MCommit`
-                self.final_mcommit_action(dot, clock, votes)
-            }
-            _ => {
-                // if the command accesses more than one shard, send an
-                // MCommitShard to the process in the shard targetted by the
-                // client; this process will then aggregate all the MCommitShard
-                // and send an MCommitShardAggregated back once it receives an
-                // MCommitShard from each shard; assuming that all
-                // shards take the fast path, this approach should work well; if
-                // there are slow paths, we probably want to disseminate each
-                // shard commit clock to all participants so that detached votes
-                // are generated ASAP; with n = 3 or f = 1, this is not a
-                // problem since we'll always take the fast path
-                // - TODO: revisit this approach once we implement recovery for
-                //   partial replication
-                // create shards commit info
-                let info = self.cmds.get(dot);
-                // initialize shards commit info if not yet initialized:
-                // - it may already be initialized if we receive the
-                //   `MCommitShard` from another shard before we were able to
-                //   commit the command in our own shard
-                if let Some(shards_commits) = info.shards_commits.as_mut() {
-                    // if already initialized, simply save votes
-                    shards_commits.set_votes(votes);
-                } else {
-                    // otherwise, initialize it (and also save votes)
-                    let process_id = self.bp.process_id;
-                    let shard_count = info.cmd.as_ref().unwrap().shard_count();
-                    let mut shards_commits =
-                        ShardsCommits::new(process_id, shard_count);
-                    shards_commits.set_votes(votes);
-                    info.shards_commits = Some(shards_commits);
-                };
-
-                // create `MShardCommit`
-                let mshard_commit = Message::MShardCommit { dot, clock };
-                // the aggregation with occurs at the process in targetted shard
-                // (which is the owner of the commmand's `dot`)
-                let target = singleton!(dot.source());
-                vec![Action::ToSend {
-                    target,
-                    msg: mshard_commit,
-                }]
-            }
-        }
-    }
-
-    fn final_mcommit_action(
-        &self,
         dot: Dot,
         clock: u64,
         votes: Votes,
-    ) -> Vec<Action<Self>> {
-        let mcommit = Message::MCommit { dot, clock, votes };
-        let target = self.bp.all();
-        vec![Action::ToSend {
-            target,
-            msg: mcommit,
-        }]
+        to_processes: &mut Vec<Action<Self>>,
+    ) {
+        let create_mcommit =
+            |dot, clock, votes| Message::MCommit { dot, clock, votes };
+        let create_mshard_commit =
+            |dot, clock| Message::MShardCommit { dot, clock };
+        let update_shards_commit_info =
+            |shards_commits_info: &mut ShardsCommitsInfo, votes| {
+                shards_commits_info.set_votes(votes)
+            };
+
+        partial::mcommit_actions(
+            bp,
+            &mut info.shards_commits,
+            shard_count,
+            dot,
+            clock,
+            votes,
+            create_mcommit,
+            create_mshard_commit,
+            update_shards_commit_info,
+            to_processes,
+        )
     }
 
     // Replaces the value `local_votes` with empty votes, returning the previous
@@ -1167,8 +1105,7 @@ struct NewtInfo {
     status: Status,
     quorum: HashSet<ProcessId>,
     synod: Synod<u64>,
-    // `None` if not set yet (not like in `Atlas` where this `None` would be a
-    // `noOp` - there are no `noOp`'s in `Newt`)
+    // `None` if not set yet
     cmd: Option<Command>,
     // `votes` is used by the coordinator to aggregate `ProcessVotes` from fast
     // quorum members
@@ -1177,7 +1114,7 @@ struct NewtInfo {
     // reported by fast quorum members and the number of times it was reported
     quorum_clocks: QuorumClocks,
     // `shard_commits` is only used when commands accessed more than one shard
-    shards_commits: Option<ShardsCommits>,
+    shards_commits: Option<ShardsCommits<ShardsCommitsInfo>>,
 }
 
 impl Info for NewtInfo {
@@ -1201,47 +1138,19 @@ impl Info for NewtInfo {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ShardsCommits {
-    process_id: ProcessId,
-    shard_count: usize,
-    participants: HashSet<ProcessId>,
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+struct ShardsCommitsInfo {
     max_clock: u64,
     votes: Option<Votes>,
 }
 
-impl ShardsCommits {
-    fn new(process_id: ProcessId, shard_count: usize) -> Self {
-        let participants = HashSet::with_capacity(shard_count);
-        let max_clock = 0;
-        Self {
-            process_id,
-            shard_count,
-            participants,
-            max_clock,
-            votes: None,
-        }
+impl ShardsCommitsInfo {
+    fn add(&mut self, clock: u64) {
+        self.max_clock = std::cmp::max(self.max_clock, clock);
     }
 
     fn set_votes(&mut self, votes: Votes) {
         self.votes = Some(votes);
-    }
-
-    fn add(&mut self, from: ProcessId, clock: u64) -> bool {
-        assert!(self.participants.insert(from));
-        self.max_clock = std::cmp::max(self.max_clock, clock);
-        log!(
-            "p{}: ShardsCommits:add {} {} | current max = {} | participants = {:?} | shard count = {}",
-            self.process_id,
-            from,
-            clock,
-            self.max_clock,
-            self.participants,
-            self.shard_count
-        );
-
-        // we're done once we have received a message from each shard
-        self.participants.len() == self.shard_count
     }
 }
 
@@ -1265,6 +1174,9 @@ pub enum Message {
         dot: Dot,
         clock: u64,
         votes: Votes,
+    },
+    MCommitClock {
+        clock: u64,
     },
     MDetached {
         detached: Votes,
@@ -1321,6 +1233,9 @@ impl MessageIndex for Message {
             Self::MCollect { dot, .. } => worker_dot_index_shift(&dot),
             Self::MCollectAck { dot, .. } => worker_dot_index_shift(&dot),
             Self::MCommit { dot, .. } => worker_dot_index_shift(&dot),
+            Self::MCommitClock { .. } => {
+                worker_index_no_shift(CLOCK_BUMP_WORKER_INDEX)
+            }
             Self::MDetached { .. } => {
                 worker_index_no_shift(CLOCK_BUMP_WORKER_INDEX)
             }
@@ -1370,7 +1285,7 @@ impl PeriodicEventIndex for PeriodicEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Status {
     START,
-    PENDING,
+    PAYLOAD,
     COLLECT,
     COMMIT,
 }
@@ -1514,7 +1429,8 @@ mod tests {
         // register command in executor and submit it in newt 1
         let (process, executor, time) = simulation.get_process(target);
         executor.wait_for(&cmd);
-        let mut actions = process.submit(None, cmd, time);
+        process.submit(None, cmd, time);
+        let mut actions: Vec<_> = process.to_processes_iter().collect();
         // there's a single action
         assert_eq!(actions.len(), 1);
         let mcollect = actions.pop().unwrap();
@@ -1569,13 +1485,16 @@ mod tests {
 
         // process 1 should have something to the executor
         let (process, executor, _) = simulation.get_process(process_id_1);
-        let to_executor = process.to_executor();
+        let to_executor: Vec<_> = process.to_executors_iter().collect();
         assert_eq!(to_executor.len(), 1);
 
         // handle in executor and check there's a single command ready
         let mut ready: Vec<_> = to_executor
             .into_iter()
-            .flat_map(|info| executor.handle(info))
+            .flat_map(|info| {
+                executor.handle(info);
+                executor.to_clients_iter().collect::<Vec<_>>()
+            })
             .map(|result| result.unwrap_ready())
             .collect();
         assert_eq!(ready.len(), 1);
@@ -1589,7 +1508,8 @@ mod tests {
             .expect("there should a new submit");
 
         let (process, _, time) = simulation.get_process(target);
-        let mut actions = process.submit(None, cmd, time);
+        process.submit(None, cmd, time);
+        let mut actions: Vec<_> = process.to_processes_iter().collect();
         // there's a single action
         assert_eq!(actions.len(), 1);
         let mcollect = actions.pop().unwrap();

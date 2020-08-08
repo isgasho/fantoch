@@ -10,14 +10,13 @@ use fantoch::kvs::{KVOp, KVStore, Key};
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
-#[derive(Clone)]
 pub struct TableExecutor {
-    process_id: ProcessId,
     execute_at_commit: bool,
     table: MultiVotesTable,
     store: KVStore,
     pending: Pending,
     metrics: ExecutorMetrics,
+    to_clients: Vec<ExecutorResult>,
 }
 
 impl Executor for TableExecutor {
@@ -42,14 +41,15 @@ impl Executor for TableExecutor {
         let aggregate = executors == 1;
         let pending = Pending::new(aggregate, process_id, shard_id);
         let metrics = ExecutorMetrics::new();
+        let to_clients = Vec::new();
 
         Self {
-            process_id,
             execute_at_commit: config.execute_at_commit(),
             table,
             store,
             pending,
             metrics,
+            to_clients,
         }
     }
 
@@ -62,7 +62,7 @@ impl Executor for TableExecutor {
         self.pending.wait_for_rifl(rifl);
     }
 
-    fn handle(&mut self, info: Self::ExecutionInfo) -> Vec<ExecutorResult> {
+    fn handle(&mut self, info: Self::ExecutionInfo) {
         // handle each new info by updating the votes table and execute ready
         // commands
         match info {
@@ -75,22 +75,24 @@ impl Executor for TableExecutor {
                 votes,
             } => {
                 if self.execute_at_commit {
-                    self.execute(key, std::iter::once((rifl, op)))
+                    self.execute(key, std::iter::once((rifl, op)));
                 } else {
                     let to_execute =
                         self.table.add_votes(dot, clock, rifl, &key, op, votes);
-                    self.execute(key, to_execute)
+                    self.execute(key, to_execute);
                 }
             }
             TableExecutionInfo::DetachedVotes { key, votes } => {
-                if self.execute_at_commit {
-                    vec![]
-                } else {
+                if !self.execute_at_commit {
                     let to_execute = self.table.add_detached_votes(&key, votes);
-                    self.execute(key, to_execute)
+                    self.execute(key, to_execute);
                 }
             }
         }
+    }
+
+    fn to_clients(&mut self) -> Option<ExecutorResult> {
+        self.to_clients.pop()
     }
 
     fn parallel() -> bool {
@@ -104,19 +106,21 @@ impl Executor for TableExecutor {
 
 impl TableExecutor {
     #[instrument(skip(self, key, to_execute))]
-    fn execute<I>(&mut self, key: Key, to_execute: I) -> Vec<ExecutorResult>
+    fn execute<I>(&mut self, key: Key, to_execute: I)
     where
         I: Iterator<Item = (Rifl, KVOp)>,
     {
-        to_execute
-            .filter_map(|(rifl, op)| {
-                // execute op in the `KVStore`
-                let op_result = self.store.execute(&key, op);
+        to_execute.for_each(|(rifl, op)| {
+            // execute op in the `KVStore`
+            let op_result = self.store.execute(&key, op);
 
-                // add partial result to `Pending`
+            // add partial result to `Pending`
+            if let Some(executor_result) =
                 self.pending.add_partial(rifl, || (key.clone(), op_result))
-            })
-            .collect()
+            {
+                self.to_clients.push(executor_result);
+            }
+        })
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

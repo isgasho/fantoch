@@ -10,7 +10,6 @@ use fantoch::HashSet;
 use serde::{Deserialize, Serialize};
 use threshold::VClock;
 
-#[derive(Clone)]
 pub struct GraphExecutor {
     shard_id: ShardId,
     config: Config,
@@ -18,6 +17,7 @@ pub struct GraphExecutor {
     store: KVStore,
     pending: HashSet<Rifl>,
     metrics: ExecutorMetrics,
+    to_clients: Vec<ExecutorResult>,
 }
 
 impl Executor for GraphExecutor {
@@ -35,6 +35,7 @@ impl Executor for GraphExecutor {
         let store = KVStore::new();
         let pending = HashSet::new();
         let metrics = ExecutorMetrics::new();
+        let to_clients = Vec::new();
         Self {
             shard_id,
             config,
@@ -42,6 +43,7 @@ impl Executor for GraphExecutor {
             store,
             pending,
             metrics,
+            to_clients,
         }
     }
 
@@ -54,21 +56,21 @@ impl Executor for GraphExecutor {
         assert!(self.pending.insert(rifl));
     }
 
-    fn handle(&mut self, info: Self::ExecutionInfo) -> Vec<ExecutorResult> {
-        let to_execute = if self.config.execute_at_commit() {
-            vec![info.cmd]
+    fn handle(&mut self, info: Self::ExecutionInfo) {
+        if self.config.execute_at_commit() {
+            self.execute(info.cmd);
         } else {
             // handle each new info
             self.graph.add(info.dot, info.cmd, info.clock);
             // get more commands that are ready to be executed
-            self.graph.commands_to_execute()
-        };
+            while let Some(cmd) = self.graph.command_to_execute() {
+                self.execute(cmd);
+            }
+        }
+    }
 
-        // execute them all
-        to_execute
-            .into_iter()
-            .filter_map(|cmd| self.execute(cmd))
-            .collect()
+    fn to_clients(&mut self) -> Option<ExecutorResult> {
+        self.to_clients.pop()
     }
 
     fn parallel() -> bool {
@@ -81,7 +83,7 @@ impl Executor for GraphExecutor {
 }
 
 impl GraphExecutor {
-    fn execute(&mut self, cmd: Command) -> Option<ExecutorResult> {
+    fn execute(&mut self, cmd: Command) {
         // get command rifl
         let rifl = cmd.rifl();
         // execute the command
@@ -90,9 +92,7 @@ impl GraphExecutor {
         // if it was pending locally, then it's from a client of this
         // process
         if self.pending.remove(&rifl) {
-            Some(ExecutorResult::Ready(result))
-        } else {
-            None
+            self.to_clients.push(ExecutorResult::Ready(result));
         }
     }
 
